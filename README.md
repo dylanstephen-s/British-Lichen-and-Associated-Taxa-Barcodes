@@ -29,3 +29,4 @@ its_seq_meta.csv - Full ITS region
 Scripts:
 global_fungi_downloader.py - Python script to webscrape sequence data from the GlobalFungi database.
 
+
