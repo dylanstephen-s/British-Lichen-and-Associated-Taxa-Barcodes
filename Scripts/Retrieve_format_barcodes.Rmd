@@ -1,0 +1,3103 @@
+---
+title: "Retrieve_format_barcode"
+author: "D Stephens"
+date: "2025-07-17"
+output: html_document
+---
+
+# Setup Env and Libraries
+```{r}
+
+# Set working directory
+
+# Load Libraries
+library(dplyr)
+library(tidyr)
+library(Biostrings)
+library(taxize)
+library(VennDiagram)
+library(ggplot2)
+library(sf)
+library(stringr)
+library(readxl)
+library(purrr)
+library(selenider)
+library(rvest)
+library(tidyr)
+library(xml2)
+library(httr)
+library(jsonlite)
+library(rentrez)
+library(gbfetch)
+library(grid)
+library(ggpattern)
+library(scales)
+library(ggpubr)
+library(ggrepel)
+
+```
+
+# Prepare Name Change Data
+Takes British Lichen Society's Taxon Dictionary and places synonyms/historic names in an old name column and current name in the new name column. This will be used to homogenize sequence records once retrieved.
+```{r}
+# British Lichen Society Taxon Dictionary
+bls <- read.csv("Taxonomy/bls-taxon-dictionary-2024-10-01.csv")
+
+# Join to DB to get old and new names
+names <- bls %>% select(Name, Current.Taxon.Name, Synonyms)
+
+# replace semicolons with commas
+names <- names %>%
+  mutate(Synonyms = gsub(";", ",", Synonyms))
+
+# Split the taxon_list column into multiple rows based on the comma
+names <- names %>%
+  separate_rows(Synonyms, sep = ",")
+
+# Trim any extra spaces
+names <- names %>%
+  mutate(Synonyms = trimws(Synonyms))
+
+names <- names %>%
+  # Gather Name and Synonyms into the old_name column
+  pivot_longer(cols = c("Name", "Synonyms"), 
+               names_to = "type", 
+               values_to = "old_name") %>%
+  filter(old_name != "") %>%  # Remove empty rows after pivoting
+  select(old_name, new_name = Current.Taxon.Name)
+
+# Split the old and new name values by spaces and extract the first two words
+names$old_name <- sapply(strsplit(names$old_name, "\\s+"), function(words) {
+  paste(words[1:min(2, length(words))], collapse = " ")
+})
+
+names$new_name <- sapply(strsplit(names$new_name, "\\s+"), function(words) {
+  paste(words[1:min(2, length(words))], collapse = " ")
+})
+
+# odd characters
+names$old_name <- gsub("\\?", "", names$old_name)
+names$new_name <- gsub("\\?", "", names$new_name)
+names <- names %>%
+  mutate(old_name = trimws(old_name),
+         new_name = trimws(new_name))
+
+# Remove NA values
+names$new_name <- gsub("NA", NA, names$new_name)
+names <- na.omit(names)
+
+# remove sp. and one word values in either old or new name
+names$old_name <- gsub(" sp.", "", names$old_name)
+names$new_name <- gsub(" sp.", "", names$new_name)
+
+# Filter out entries that are only one word
+names <- names[sapply(strsplit(names$old_name, "\\s+"), length) > 1, ]
+names <- names[sapply(strsplit(names$new_name, "\\s+"), length) > 1, ]
+
+names <- unique(names)
+
+# Write out names
+# write.csv(names, "Taxonomy/name_changes.csv")
+
+
+```
+
+# Sequence Data Retrieval
+## GenBank
+Check for which markers have the most species coverage
+```{r}
+
+# Enter key here
+ncbi_api_key = ""
+Sys.setenv(ENTREZ_KEY = ncbi_api_key)
+
+# Define your list of lichen species
+lichen_species <- c("Cladonia rangiferina", "Usnea barbata", "Parmelia sulcata")
+lichen_species <- sort(unique(names$old_name, names$new_name))
+lichen_species <- lichen_species[2049:length(lichen_species)]
+
+# Initialize an empty dataframe to store metadata
+all_metadata <- data.frame()
+i = 1
+  
+# Loop through each lichen species and fetch metadata
+for (species in lichen_species) {
+  cat("Fetching metadata for:", species, "\n")
+  cat("Species: ", i, " of ", length(lichen_species), "\n")
+  
+  # Construct the query for GenBank
+  query <- paste0(species, "[ORGN]")  # Search for the species in the organism field
+  
+  # Fetch metadata
+  species_metadata <- tryCatch(
+    {
+      fetch_metadata(query = query, chunk_size = 10, max_tries = 10, verbose = TRUE)
+    },
+    error = function(e) {
+      cat("Error fetching metadata for", species, ":", e$message, "\n")
+      return(NULL)
+    }
+  )
+  
+  i = i + 1
+  
+  # Append metadata to the main dataframe
+  if (!is.null(species_metadata)) {
+    
+    all_metadata <- rbind(all_metadata, species_metadata)
+  }
+
+}
+
+# genbank_metadata <- all_metadata
+genbank_metadata <- read.csv("Databases/genbank/genbank_metadata.csv", row.names = "X.1")
+
+genbank_metadata <- genbank_metadata %>% select(-X)
+
+# Fix names
+names <- read.csv("Taxonomy/name_changes.csv", row.names = "X")
+
+# Country filtering
+euro_countries <- c("Russia", 'Germany', "United Kingdom", "France", "Italy", "Spain", "Poland", "Ukraine", "Romania", "Netherlands", "Belgium", "Czech Republic", "Sweden", "Portugal", "Greece", "Hungary", "Austria", "Belarus", "Switzerland", "Bulgaria", "Serbia", "Denmark", "Finland", "Norway", "Slovakia", "Ireland", "Croatia", "Bosnia and Herzegovina", "Moldova", "Lithuania", "Albania", "Slovenia", "Latvia", "North Macedonia", "Estonia", "Luxembourg", "Montenegro", "Malta", "Iceland", "Andorra", "Liechtenstein", "Monaco", "San Marino", "Holy See")
+
+# Extract country information into a new column
+genbank_metadata$country <- mapply(function(subtype, subname) {
+  # Split the strings
+  subtype_fields <- unlist(strsplit(subtype, "\\|"))
+  subname_values <- unlist(strsplit(subname, "\\|"))
+  
+  # Find the position of 'country' in subtype
+  country_index <- which(subtype_fields == "country")
+  
+  # Return country value if it exists
+  if (length(country_index) == 1 && length(subname_values) >= country_index) {
+    return(subname_values[country_index])
+  } else {
+    return(NA)
+  }
+}, genbank_metadata$subtype, genbank_metadata$subname)
+
+genbank_metadata$country <- str_split_i(genbank_metadata$country, ":", 1) 
+
+# Filter Countries
+genbank_metadata <- genbank_metadata %>%
+  filter(country %in% euro_countries)
+
+# Genetic Marker Filter
+marker_mapping <- list(
+  "ITS" = c("ITS", "internal transcribed spacer", "intergenic spacer region"),
+  "ITS1" = c("ITS1", "internal transcribed spacer 1"),
+  "ITS2" = c("ITS2", "internal transcribed spacer 2"),
+  "5.8S" = c("5.8S", "5.8S ribosomal RNA gene"),
+  "COX1" = c("cox1", "COX1", "yclooxygenase-1", "ytochrome c oxidase subunit 1"),
+  "EF1a" = c("EF1a", "elongation factor 1a-like gene", "EF-1", "elongation factor 1"),
+  "TEF1" = c("TEF1", "tef1", "Tef1", "tef-1"),
+  "Sog2" = c("Sog2"),
+  "28S-18S" = c("28S-18S", "28S-18S ribosomal RNA intergenic spacer, partial sequence"),
+  "IGS" = c("IGS", "28S-18S ribosomal RNA intergenic spacer", "intergenic spacer"),
+  "GPD" = c("GPD", "gpd"),
+  "pks2" = c("pks2"),
+  "GAPDH" = c("GAPDH", "glyceraldehyde-3-phosphate dehydrogenase"),
+  "TSR1" = c("TSR1"),
+  "GZU" = c("GZU"),
+  "RPS3aE" = c("RPS3aE"),
+  "benA" = c("benA"),
+  "hypothetical protein" = c("hypothetical protein"),
+  "MCM7" = c("MCM7", "mcm7", "Mcm7", "minichromosome maintenance complex component 7-like gene"),
+  "TUB2" = c("beta-tubulin gene", "beta tubulin", "beta-tubulin-like gene", "beta-tubilin", "beta-tubulin", "TUB2", "beta-tublin"),
+  "mRNA sequence" = c("mRNA sequence"),
+  "nucLSU" = c("large subunit ribosomal RNA", "28S"),
+  "nucSSU" = c("18S"),
+  "mtSSU" = c("small subunit ribosomal RNA gene, partial sequence; mitochondrial"),
+  "40S" = c("40S"),
+  "23S" = c("23S"),
+  "12S" = c("12S"),
+  "16S" = c("16S"),
+  "60S" = c("60S"),
+  "RPB2" = c("RPB2", "DNA-directed RNA polymerase II", "RNA polymerase II second largest subunit", "RNA polymerase 2 largest subunit gene"),
+  "RPB1" = c("RPB1", "RNA polymerase II largest subunit", "RNA polymerase II large subunit", "RNA polymerase II large subunit"),
+  "mitochondrion" = c("mitochondrion"),
+  "whole genome" = c("whole genome"),
+  "LNS2" = c("LNS2"),
+  "PGK" = c("PGK", "3-phosphate dehydrogenase", "3 phosphate dehydrogenas", "pgk", "phosphoglycerate kinase 1"),
+  "COX2" = c("COX2", "cox2", "yclooxygenase-2", "yclooxygenase-2"),
+  "PKS" = c("PKS", "pks"),
+  "ks1" = c("ks1"),
+  "25S" = c("25S"),
+  "elongation factor 3" = c("elongation factor 3"),
+  "chromosome" = c("chromosome"),
+  "mep1A" = c("mep1A"),
+  "ChsG" = c("ChsG"),
+  "heat shock protein" = c("heat shock protein"),
+  "hsp72" = c("hsp72"),
+  "AnG22" = c("AnG22"),
+  "AnG25" = c("AnG25"),
+  "AnG23" = c("AnG23"),
+  "mep1B" = c("mep1B"),
+  "mep2" = c("mep2"),
+  "actin" = c("actin"),
+  "elongation factor 2" = c("elongation factor 2"),
+  "26S rRNA" = c("26S rRNA"),
+  "TOP1" = c("TOP1", "DNA topoisomerase I", "DNA topoisomerase 1")
+)
+
+# Function to add marker columns and consolidate them
+add_marker_columns <- function(data, marker_mapping) {
+  # Create an empty dataframe for marker columns
+  marker_columns <- data.frame(matrix(0, nrow = nrow(data), ncol = length(marker_mapping)))
+  colnames(marker_columns) <- names(marker_mapping)
+  
+  # Loop through each marker in the mapping
+  for (marker in names(marker_mapping)) {
+    # Create a regex pattern for all synonyms of the marker
+    pattern <- paste(marker_mapping[[marker]], collapse = "|")
+    
+    # Add a column for the marker
+    marker_columns[[marker]] <- as.integer(grepl(pattern, data$title, ignore.case = TRUE))
+  }
+  
+  # Bind marker columns to the original dataframe
+  data <- cbind(data, marker_columns)
+  return(data)
+}
+
+# Apply the function to add marker columns
+genbank_metadata <- add_marker_columns(genbank_metadata, marker_mapping)
+
+# Identify rows where no markers matched
+unmatched_rows <- genbank_metadata %>%
+  filter(rowSums(across(names(marker_mapping))) == 0)
+
+# 1997 entries without gene ID,in 75,000 records
+
+# Create Marker_Combination column explicitly
+genbank_metadata <- genbank_metadata %>%
+  mutate(Marker_Combination = apply(across(names(marker_mapping)), 1, function(row) {
+    if (sum(row) > 1) {
+      paste(names(row)[which(row == 1)], collapse = ", ")
+    } else {
+      NA
+    }
+  }))
+
+
+# Summarize by Marker_Combination
+combination_summary <- genbank_metadata %>%
+  filter(!is.na(Marker_Combination)) %>%  # Only rows with non-NA Marker_Combination
+  group_by(Marker_Combination) %>%  # Group by Marker_Combination
+  summarize(
+    Species_Count = n_distinct(species),
+    .groups = "drop"
+  ) %>%
+  dplyr::rename(Marker = Marker_Combination)  # Rename column for clarity
+
+# Group by species and calculate unique species count per marker
+species_marker_summary <- genbank_metadata %>%
+  group_by(species) %>%
+  summarize(across(names(marker_mapping), max)) %>% # Use max to detect presence across rows for a species
+  summarize(across(names(marker_mapping), sum)) %>% # Sum the presence across species
+  pivot_longer(cols = everything(), names_to = "Marker", values_to = "Species_Count") %>%
+  arrange(desc(Species_Count))
+
+# Bind individual and combination summaries
+combined_and_individual <- bind_rows(species_marker_summary, combination_summary)
+
+# Get the top 20 markers
+top_20_markers <- combined_and_individual[order(-combined_and_individual$Species_Count), ][1:20, ]
+
+```
+
+### Plot GenBank Prelim Data
+```{r}
+
+ggplot(top_20_markers, aes(x = reorder(Marker, -Species_Count), y = Species_Count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Top 20 Marker Combinations and Individual Markers by Species Count",
+    x = "Marker",
+    y = "Species Count"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Filter Markers
+targeted_markers <- c("COX1", "COX2", "TEF1","ITS2", "ITS1", "IGS", "nucLSU", "nucSSU", "mtSSU", "mtLSU","IGS", "TUB2", "RPB1", "RPB2", "TEF1", "PGK")
+
+targeted_markers_df <- combined_and_individual %>% filter(Marker %in% targeted_markers)
+
+# Plot the top 20 markers
+ggplot(targeted_markers_df, aes(x = reorder(Marker, -Species_Count), y = Species_Count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "",
+    x = "Marker",
+    y = "Number of Species"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# ITS
+## UNITE
+Two methods to download data, can compile both of these
+### Method 1
+#### Species Webscrape
+Searches on UNTIE sequence tab for species then grabs records by text
+```{r}
+
+# Start a new session
+session <- selenider_session("selenium", browser = "chrome")
+
+# Define a function to reset the session
+reset_session <- function() {
+  # Safely close any previous session if one exists
+  tryCatch({
+    session %>% session$close()
+  }, error = function(e) {
+    message("No session to close or session already closed.")
+  })
+  
+  # Open the URL
+  open_url("https://unite.ut.ee/search.php?qresult_seq=yes&dataset=unite&taxon_name_seq=&taxon_id_seq=&taxon_name_repr_seq=&accno_seq=&it_seq=&it_id_seq=&it_repr_seq=&country_seq=&country_id_seq=&country_repr_seq=&insd_organism=&source_seq=&ecm_lineage_seq=&region_seq=1#fndtn-panel2")
+  
+  Sys.sleep(1)  # Allow the page to fully load before proceeding
+  return(session)
+}
+
+# Helper function to check if an element exists using tryCatch
+elem_exists <- function(selector) {
+  tryCatch({
+    el <- s(selector)
+    TRUE  # If element is found
+  }, error = function(e) {
+    FALSE  # If element is not found
+  })
+}
+
+UNITE_sequences <- data.frame()
+# Caloplaca albolutescens
+species_list <- unique(names$old_name, names$new_name)
+
+species_list <- species_list[1:30]
+
+for (species in species_list){
+  
+  open_url("https://unite.ut.ee/search.php?qresult_seq=yes&dataset=unite&taxon_name_seq=&taxon_id_seq=&taxon_name_repr_seq=&accno_seq=&it_seq=&it_id_seq=&it_repr_seq=&country_seq=&country_id_seq=&country_repr_seq=&insd_organism=&source_seq=&ecm_lineage_seq=&region_seq=1#fndtn-panel2")
+  
+  s("#region_seq_all") %>% elem_click
+  
+  # Find the search box element and enter the species name
+  search <- s("#taxon_name_seq")
+  # search %>% elem_clear_value() %>% elem_send_keys(species)
+  search %>% elem_clear_value() %>% elem_send_keys(species)
+  
+  Sys.sleep(2)
+  
+  search %>% elem_send_keys("\uE007")
+  
+  Sys.sleep(1)
+      
+  # Send GO on species
+  go_button <- s("#seq_search_full > div > div > div:nth-child(4) > div:nth-child(5) > input")
+  go_button %>% elem_click()
+  
+  Sys.sleep(1)
+  
+  # Check if the results table exists
+  if (s("#panel2_results") %>% elem_text() == "No records found, please specify search parameters.") {
+      message(paste("No records found, skipping:", species))
+      next
+  } else {
+    # Extract content for check
+    table_content <- s("#panel2_results > div > div > table > tbody") %>% elem_text()
+  
+    # Check if the table contains the specific species "Phomopsis ziziphina"
+    if (grepl("Phomopsis ziziphina", table_content, ignore.case = TRUE)) {
+      message(paste("Doesn't exist as name in DB, skipping:", species))
+      next
+    } else {
+      message(paste("Proceeding with species:", species))
+    }
+  }
+
+  # Try to extract each column's text with error handling
+  species_info <- tryCatch({
+    s("#panel2_results > div > div > table > tbody") %>% elem_text()
+  }, error = function(e) {
+      NA  # Return NA if there's an error
+  })
+  
+  # If the species is found, proceed with extracting information
+  beginning <- "Accession number UNITE taxon name Country Source"
+  end <- "TWEETS"
+      
+  # Clip the relevant portion between "beginning" and "end"
+  clipped_text <- sub(paste0(".*", beginning), "", species_info)
+  clipped_text <- sub(paste0(end, ".*"), "", clipped_text)
+      
+  # Split the rows (each species is on a separate line after the clipped part)
+  rows <- unlist(strsplit(clipped_text, "\n"))
+  n_records <- length(rows)
+      
+  # Clean the rows by removing empty ones and trimming whitespace
+  rows <- rows[rows != ""]
+  rows <- trimws(rows)
+      
+  # Remove the leading number and period
+  rows_clean <- sub("^\\d+\\.\\s*", "", rows)
+      
+  # Split each row by spaces
+  split_rows <- strsplit(rows_clean, "\\s+")
+  
+  # Extract the relevant parts
+  accession_numbers <- sapply(split_rows, function(x) x[1])
+  taxon_names <- species
+  countries_sources <- sapply(split_rows, function(x) paste(x[4:length(x)], collapse = " "))
+  
+  countries <- str_split_i(countries_sources, "Fungus:", 1)
+  countries <- trimws(countries)
+  sources <- str_split_i(countries_sources, "Fungus:", 2)
+  sources <- trimws(sources)
+      
+  # Combine into a data frame
+  df <- data.frame(Accession_Number = accession_numbers, 
+                       Taxon_Name = taxon_names, 
+                       Country = countries, 
+                       Source = sources,
+                       stringsAsFactors = FALSE)
+
+  df$sequence <- NA
+  df$Marker <- NA
+  
+  Sys.sleep(1)
+  
+  for (i in 1:n_records){
+    
+    # Dynamically get the correct selector based on the number of records
+    selector <- "#panel2_results > div > div > table > tbody > tr > td:nth-child(2) > a"
+    
+      # Special case for the first record
+    if (i == 1) {
+      selector <- "#panel2_results > div > div > table > tbody > tr > td:nth-child(2) > a"
+    } else {
+      # For all other records, use the nth-child selector
+      selector <- paste0("#panel2_results > div > div > table > tbody > tr:nth-child(", i, ") > td:nth-child(2) > a")
+    }
+    
+    # Wait until the element is visible and clickable
+    record_temp <- s(selector)
+    record_temp %>% elem_click()
+    
+    # Get windows
+    all_windows <- session$driver$window_handles()
+    
+    # Switch to other window
+    session$driver$switch_to_window(all_windows[[2]][1])
+    
+    Sys.sleep(1)
+    
+    text <- s("#main > div:nth-child(3) > div > div > div > table:nth-child(2) > tbody") %>% elem_text()
+    
+    # Extract the part after "Sequenced regions"
+    matched <- str_match(text, "Sequenced regions\\s*(.*)\\n")
+    sequenced_regions <- matched[,2]
+    
+    # Extract the part after Sequence
+    sequence <- str_match(text, "Sequence \\s*(.*)\\n")
+    sequence <- sequence[,2]
+    
+    # Extract the part after the closing parenthesis
+    sequence <- str_match(sequence, "\\)\\s*(.*)")
+    sequence <- sequence[,2]
+    
+    # Print the extracted part
+    print(sequenced_regions)
+    
+    df[i, "Marker"] <- sequenced_regions
+    df[i, "sequence"] <- sequence
+    
+    Sys.sleep(1)  
+    
+    session$driver$close_window()
+    
+    # Back to old window
+    session$driver$switch_to_window(all_windows[[1]][1])
+    
+    print(species)
+    
+  }
+  
+  UNITE_sequences <- bind_rows(UNITE_sequences, df)
+}
+
+# write.csv(unite_sequences, "UNITE_sequences.csv")
+
+```
+
+#### Clean webscrape
+```{r}
+
+UNITE_sequences <- UNITE_sequences %>% select(-col3, -col4)
+
+# Ensure that col1 and col2 are cleaned of extra spaces
+UNITE_sequences$col1 <- gsub(" ", "", UNITE_sequences$col1)
+UNITE_sequences$col2 <- gsub(" ", "", UNITE_sequences$col2)
+
+# Remove locked sequences
+UNITE_sequences <- UNITE_sequences %>%
+  filter(!grepl("Locked", col1, ignore.case = TRUE)) %>%
+  filter(!grepl("Locked", col2, ignore.case = TRUE))
+
+# Define a stricter pattern to match strings
+dna_pattern <- "^[TCGAMNWRYSK]+$"
+
+# Apply the stricter pattern to col1 and col2
+UNITE_sequences$col1 <- ifelse(grepl(dna_pattern, UNITE_sequences$col1, ignore.case = FALSE),
+                               UNITE_sequences$col1, NA)
+
+UNITE_sequences$col2 <- ifelse(grepl(dna_pattern, UNITE_sequences$col2, ignore.case = FALSE),
+                               UNITE_sequences$col2, NA)
+
+# Combine columns and handle NA values
+UNITE_sequences$sequence <- coalesce(UNITE_sequences$col1, UNITE_sequences$col2)
+
+# remove col1 and col2
+UNITE_sequences <- UNITE_sequences %>% select(-col1, -col2)
+
+# Fix accession
+UNITE_sequences$Accession_Number <- str_split_i(UNITE_sequences$Accession_Number, "\\|", 1)
+
+
+# 220
+UNITE_sequences$Country <- ifelse(grepl("China", UNITE_sequences$Country), "China", UNITE_sequences$Country)
+UNITE_sequences$Country <- ifelse(grepl("Switzerland", UNITE_sequences$Country), "Switzerland", UNITE_sequences$Country)
+UNITE_sequences$Country <- ifelse(grepl("United States", UNITE_sequences$Country), "United States", UNITE_sequences$Country)
+UNITE_sequences$Country <- ifelse(grepl("Venezuela", UNITE_sequences$Country), "Venezuela", UNITE_sequences$Country)
+UNITE_sequences$Country <- ifelse(grepl("France", UNITE_sequences$Country), "France", UNITE_sequences$Country)
+UNITE_sequences$Country <- ifelse(grepl("Unspecified", UNITE_sequences$Country), NA, UNITE_sequences$Country)
+UNITE_sequences$Country <- ifelse(grepl("Russian Federation", UNITE_sequences$Country), "Russia", UNITE_sequences$Country)
+UNITE_sequences$Country <- ifelse(grepl("Ukraine", UNITE_sequences$Country), "Ukraine", UNITE_sequences$Country)
+UNITE_sequences$Country <- ifelse(grepl("Estonia", UNITE_sequences$Country), "Estonia", UNITE_sequences$Country)
+
+# Replace empty entries in a specific column (e.g., col1) with NA
+UNITE_sequences <- UNITE_sequences %>%
+  mutate(Country = ifelse(Country == "", NA, Country))
+
+# Filter sequences for just the European
+UNITE_sequences_euro <- UNITE_sequences %>% filter(Country %in% euro_countries)
+
+# Replace values in taxon_list using the lookup vector
+UNITE_sequences_euro_replace <- UNITE_sequences_euro %>%
+  mutate(Taxon_Name = ifelse(Taxon_Name %in% names(lookup_vector), 
+                             lookup_vector[Taxon_Name], 
+                             Taxon_Name))
+
+# write.csv(UNITE_sequences_euro_replace, "Output/UNITE_seq_meta.csv")
+
+```
+
+### Method 2
+*Used this version, but method 1 can also be used, won't recover every sequence per SH*
+#### SH Webscrape
+Download the qiime from the UNITE website
+```{r}
+species_list <- unique(names$old_name, names$new_name)
+
+# Tax file
+unite_tax_file <- read.delim("Databases/UNITE/sh_qiime_release_04.04.2024/sh_taxonomy_qiime_ver10_97_04.04.2024.txt")
+
+unite_tax_file <- unite_tax_file %>%
+  separate(Taxon, into = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), sep = ";")
+
+unite_tax_file <- unite_tax_file %>%
+  separate(Feature.ID, into = c("SH", "SampleID"), sep = "_")
+
+unite_tax_file <- unite_tax_file %>% select(SH, SampleID, Species)
+
+# Fix species name
+unite_tax_file$Species <- gsub("s__", "", unite_tax_file$Species)
+unite_tax_file$Species <- gsub("_sp", "", unite_tax_file$Species)
+unite_tax_file$Species <- gsub("_", " ", unite_tax_file$Species)
+
+# Take genus species and take out var and subsp
+unite_tax_file$Species <- sapply(strsplit(unite_tax_file$Species, "\\s+"), function(words) {
+  paste(words[1:min(2, length(words))], collapse = " ")
+})
+
+# Filter by lichen species
+unite_tax_file <- unite_tax_file %>% filter(Species %in% species_list)
+##################################################################################################3
+# Sequence file
+unite_sequence_file_qiime_fas <- readDNAStringSet("Databases/UNITE/sh_qiime_release_04.04.2024/sh_refs_qiime_ver10_97_04.04.2024.fasta")
+
+seq_name = names(unite_sequence_file_qiime_fas)
+Sequence = paste(unite_sequence_file_qiime_fas)
+unite_sequence_file_qiime <- data.frame(seq_name, Sequence)
+unite_sequence_file_qiime <- unite_sequence_file_qiime %>%
+    separate(seq_name, into = c("SH", "SampleID", "rep"), sep = "_") %>% select(-rep)
+
+unite_sequences_lichen <- unite_tax_file %>% left_join(unite_sequence_file_qiime)
+
+```
+
+#### Scrape every sequence per SH
+Use the Fasta file or qiime file to CSV list to loop over -> "lichen_unite_sh_codes_loop.csv"
+```{r}
+
+# write.csv(SH_unite_lichen, "lichen_unite_sh_codes_loop.csv", row.names = F)
+SH_unite_lichen <- read.csv("Databases/UNITE/lichen_unite_sh_codes_loop.csv", col.names = "SH")
+SH_unite_lichen <- SH_unite_lichen$SH
+
+# Create a new Selenium session inside each worker
+session <- selenider_session("selenium", browser = "chrome")
+SH_unite_expanded <- data.frame()
+
+# Start at 367
+for (i in 1:length(SH_unite_lichen)) {
+  
+  # Load the URL
+  open_url(paste0("https://unite.ut.ee/bl_forw_sh.php?sh_name=", SH_unite_lichen[i], "#fndtn-panel1"))
+  
+  Sys.sleep(1)  
+  
+  # Extract text from the table
+  table_text <- s("#main > div:nth-child(4) > div > div:nth-child(3) > div > div:nth-child(2) > div > table > tbody") %>% elem_text()
+  
+  Sys.sleep(1)
+  
+  # Parse the text into a dataframe
+  lines <- str_split(table_text, "\n")[[1]]
+  lines <- str_trim(lines)
+  data_split <- str_split(lines, "\\s{2,}")
+  temp_df <- do.call(rbind, data_split) %>% as.data.frame()
+  colnames(temp_df) <- c("SampleID", "Sequence")
+  
+  # Extract the first word (the accession code)
+  temp_df$SampleID <- str_extract(temp_df$SampleID, "^[^\\s]+")
+  
+  # Fix sequence
+  temp_df$Sequence <- gsub("-", "", temp_df$Sequence)
+  
+  rows <- nrow(temp_df)
+  
+  temp_df$Marker <- NA
+  k <- 1
+  
+  # Collect all possible row selectors
+  row_selectors <- c()
+  for (j in 1:(rows*2)) {
+    row_selectors <- c(row_selectors, paste0("#main > div:nth-child(4) > div > div:nth-child(3) > div > div:nth-child(2) > div > table > tbody > tr:nth-child(", j,") > td:nth-child(1) > a"))
+  }
+  
+  # Iterate over each row selector and try to click
+  for (selector in row_selectors) {
+    success <- FALSE  # Track if the click is successful
+    
+    # Try clicking the selector
+    tryCatch({
+      s(selector) %>% elem_click()
+      success <- TRUE
+    }, error = function(e) {
+      message(paste("Failed to click element with selector", selector))
+    })
+    
+    Sys.sleep(0.5)
+    
+    # If clicking is successful, process the rest of the page
+    if (success) {
+      
+      # Get all open windows
+      all_windows <- session$driver$window_handles()
+      
+      # Switch to the new window
+      session$driver$switch_to_window(all_windows[[2]][1])
+      
+      # Extract text from the new page
+      text <- s("#main > div:nth-child(3) > div > div > div > table:nth-child(2) > tbody") %>% elem_text()
+      
+      # Extract the part after "Sequenced regions"
+      sequenced_regions_match <- str_match(text, "Sequenced regions\\s*(.*)\\n")
+      sequenced_regions <- sequenced_regions_match[, 2]
+      
+      # Extract the text after "Sampling area"
+      country <- str_match(text, "Sampling area\\s*(.*)")[, 2]
+      
+      # Store the extracted data in your dataframe
+      temp_df[k, 'Marker'] <- sequenced_regions
+      temp_df[k, 'country'] <- country
+      
+      # Close the new window
+      session$driver$close_window()
+      
+      # Switch back to the original window
+      session$driver$switch_to_window(all_windows[[1]][1])
+      
+      k <- k + 1
+    }
+  }
+  
+  # Append data to the final dataframe
+  temp_df$SH <- SH_unite_lichen[i]
+  SH_unite_expanded <- bind_rows(SH_unite_expanded, temp_df)
+  
+  # Log the progress
+  cat(paste0(SH_unite_lichen[i], "\n", "Iteration:", i, " of ", length(SH_unite_lichen), "\n"))
+  
+  # Trigger garbage collection
+  gc()
+}
+
+
+SH_unite_expanded <- read.csv("Databases/UNITE/Lichen_sequences_UNITE.csv", row.names = "X")
+
+# Edit to get final df
+SH_unite_expanded <- unique(SH_unite_expanded)
+
+# Country name no additional info
+SH_unite_expanded$country <- str_split_i(SH_unite_expanded$country, ",", 1)
+
+# Extract Euro countries
+SH_unite_expanded <- SH_unite_expanded %>% filter(country %in% euro_countries)
+
+# Filter out locked sequences
+SH_unite_expanded <- SH_unite_expanded %>%
+  filter(Sequence != "LOCKED SEQUENCE")
+
+SH_unite_expanded <- SH_unite_expanded %>% left_join(select(unite_sequences_lichen, SH, Species))
+
+# write.csv(SH_unite_expanded, "Databases/UNITE/Lichen_sequences_UNITE_europe.csv")
+
+
+```
+
+## BOLD
+### Sequence records
+Uses API
+```{r}
+
+# Define the correct BOLD API URL for sequences
+url <- "https://v3.boldsystems.org/index.php/API_Public/sequence"
+
+# List of species
+BOLD_sequences <- data.frame(identifier = character(), sequence = character())
+
+names <- read.csv("Taxonomy/name_changes.csv", row.names = "X")
+
+taxon_list <- data.frame(taxon_list = sort(unique(c(names$old_name, names$new_name))))
+
+for (species in taxon_list$taxon_list){
+  response <- GET(url, query = list(taxon = species, format = "json"))
+  content_text <- content(response, "text", encoding = "UTF-8")
+  
+  # Check if content_text is empty, if so, move to the next record
+  if (content_text == "") {
+    message(paste("No content for taxon:", species))
+    next
+  }
+  
+  content_text <- gsub("\r", "", content_text)
+  content_text <- data.frame(data = unlist(str_split(content_text, "\n")))
+  content_df <- content_text %>%
+    mutate(type = ifelse(str_detect(data, "^>"), "identifier", "sequence")) %>%
+    mutate(group = cumsum(type == "identifier")) %>%
+    group_by(group) %>%
+    summarize(identifier = dplyr::first(data[type == "identifier"]),
+              sequence = paste(data[type == "sequence"], collapse = "")) %>%
+    select(-group)
+  
+  print(species)
+  
+  BOLD_sequences <- bind_rows(BOLD_sequences, content_df)
+}
+
+# Add new column names to split header
+BOLD_sequences$processid <- str_trim(gsub(">", "", str_split_i(BOLD_sequences$identifier, "\\|", 1)))
+
+# write.csv(BOLD_sequences, "Databases/BOLD/Bold_sequences_all.csv")
+
+```
+
+### Join specimen Data
+```{r}
+
+specimen_data <- data.frame()
+
+# Correct BOLD specimen API URL
+url_specimen <- "http://v3.boldsystems.org/index.php/API_Public/specimen?"
+
+for (id in BOLD_sequences$processid) {
+  
+  # Make API request
+  response <- GET(url_specimen, query = list(ids = id, format = "xml"))
+  
+  # Check if the response is valid XML
+  content_text <- content(response, "text", encoding = "UTF-8")
+  
+  # Check for valid XML structure before parsing
+  if (grepl("^<\\?xml", content_text)) {
+    
+    # Parse the XML response
+    xml_data <- tryCatch(read_xml(content_text), error = function(e) NULL)
+    
+    # Only proceed if parsing is successful
+    if (!is.null(xml_data)) {
+      # Find all nodes
+      allnodes <- xml_data %>% xml_find_all('//*')
+      
+      # Find the leaf nodes
+      leafs <- which((allnodes %>% xml_children() %>% xml_length()) == 0)
+      
+      # Get the value in the leafs
+      val <- (allnodes %>% xml_text())[leafs]
+      
+      # Get the path to leaves to identify the source
+      col_name <- (allnodes %>% xml_path())[leafs]
+      
+      # Create a temporary dataframe with extracted values
+      temp_df <- data.frame(col_name, val)
+      
+      # Modify the 'name' column by extracting the last part after the last '/'
+      temp_df <- temp_df %>%
+        mutate(col_name = str_extract(col_name, "[^/]+$"))
+      
+      # Pivot the data
+      pivot_temp <- pivot_wider(temp_df, names_from = col_name, values_from = val, names_repair = "minimal")
+      
+      # Combine with the main dataframe
+      specimen_data <- bind_rows(specimen_data, pivot_temp)
+      
+      # Print progress
+      print(pivot_temp$name)
+    } else {
+      message(paste("Failed to parse XML for process ID:", id))
+    }
+    
+  } else {
+    message(paste("Invalid XML format for process ID:", id))
+  }
+}
+
+# Assuming specimen_data$taxon is a list of character vectors
+specimen_data$taxon <- lapply(specimen_data$taxon, function(x) {
+  # Combine the elements of each list into a single string, separated by "/"
+  paste(x, collapse = "/")
+})
+specimen_data <- specimen_data %>% select(-taxonomy, -name, -taxID, -name)
+
+# Convert list columns to character by collapsing the list into a string for each entry
+specimen_data <- specimen_data %>%
+  mutate(across(where(is.list), ~sapply(., function(x) paste(unlist(x), collapse = ";"))))
+
+# Save the dataframe as a CSV file
+#write.csv(specimen_data, "Databases/BOLD/BOLD_sequences_metadata_all.csv", row.names = FALSE)
+
+```
+
+### Create Final BOLD Sequence Data
+```{r}
+# Read in 
+BOLD_sequences <- read.csv("Bold_sequences.csv", row.names = "X")
+BOLD_sequences <- unique(BOLD_sequences)
+BOLD_download <- read.csv("Output/BOLD.csv")
+# Scraper, not very good
+# BOLD_meta <- read.csv("BOLD_sequences_metadata.csv")
+# Get species form taxon_name
+# Extract the text that comes after any number
+BOLD_meta$taxon_ext <- sub(".*[0-9]+", "", BOLD_meta$taxon)
+BOLD_meta <- unique(BOLD_meta)
+
+# Join
+BOLD_seq_meta <- BOLD_sequences %>% left_join(BOLD_meta)
+
+# empty strings, spaces, or "Unrecoverable" with NA
+BOLD_seq_meta <- BOLD_seq_meta %>%
+  mutate(across(c(country, lat, lon), ~ na_if(trimws(.), ""))) %>%
+  mutate(across(c(country, lat, lon), ~ ifelse(. == "Unrecoverable", NA, .))) %>%
+  filter(!is.na(country) | !is.na(lat))
+
+# Select only European countries
+BOLD_seq_meta_euro <- BOLD_seq_meta %>%
+  filter(country %in% euro_countries)
+
+# Select only lichen species
+BOLD_seq_meta_euro <- BOLD_seq_meta_euro %>% filter(taxon_ext %in% c(names$old_name, names$new_name))
+
+BOLD_seq_euro <- BOLD_seq_meta_euro %>% select(identifier, sequence, country)
+
+# Separate the identifier into SampleID, Species, and Marker
+BOLD_seq_euro <- BOLD_seq_euro %>%
+  separate(identifier, into = c("SampleID", "Species", "Marker", "Extra"), sep = "\\|", extra = "drop")
+
+# Drop sequence header
+BOLD_seq_euro$SampleID <- gsub(">", "", BOLD_seq_euro$SampleID)
+
+BOLD_seq_euro <- BOLD_seq_euro %>% select(-Extra)
+
+# write.csv(BOLD_seq_euro, "Databases/BOLD/BOLD_sequences_final.csv")
+
+#######################################################################################
+
+# Replace values in GF using the lookup vector
+BOLD_seq_meta_euro_replace <- BOLD_seq_meta_euro %>%
+  mutate(taxon_ext = ifelse(taxon_ext %in% names(lookup_vector), 
+                             lookup_vector[taxon_ext], 
+                             taxon_ext))
+
+table(unique(c(names$new_name, names$old_name)) %in% unique(BOLD_seq_meta_euro$taxon_ext))
+########################################################################################
+
+```
+
+## GlobalFungi
+First run python script in order to retrieve intital data
+Note: *Global fungi only has ITS1 and ITS2 at the moment*
+### Read in files and create clean dataframe
+```{r}
+# Read in
+file_list <- list.files("Databases/Global_Fungi/Sequences/")
+global_fungi_records <- read.delim(file = "Databases/Global_Fungi/GF_sh_list_all.txt")
+global_fungi_metadata <- read.delim(file = "Databases/Global_Fungi/GF_sh_meta_all.txt")
+global_fungi_metadata <- global_fungi_metadata %>% filter(continent == "Europe")
+
+# Prep for loop
+global_fungi_sequences <- data.frame()
+SH_to_species <- unique(select(global_fungi_records, SH, Species))
+row_counter = 0
+unique_seq_counter = 0
+
+# Make loop
+for (file in seq_along(file_list)){
+  s = readDNAStringSet(paste0("Databases/Global_Fungi/Sequences/", file_list[file]))
+  seq_name = names(s)
+  Sequence = paste(s)
+  temp_df <- data.frame(seq_name, Sequence)
+  temp_df <- temp_df %>%
+    separate(seq_name, into = c("UniqueID", "SampleID", "SH_Code", "Marker", "Abundance"), sep = "\\|")
+  
+  temp_df <- temp_df %>% select(-UniqueID, -Abundance)
+  temp_df$SampleID <- gsub("SampleID_", "", temp_df$SampleID)
+  temp_df$SH_Code <- gsub("sh_", "", temp_df$SH_Code)
+  temp_df$Marker <- gsub("marker_", "", temp_df$Marker)
+  
+  # Get species name instead of SH
+  temp_df <- temp_df %>% left_join(SH_to_species, by = join_by(SH_Code == SH))
+  
+  row_counter <- row_counter + nrow(temp_df)
+  unique_seq_counter <- unique_seq_counter + length(unique(temp_df$Sequence))
+  
+  # Place into dataframe
+  temp_df <- unique(temp_df)
+  
+  # Reorganize
+  temp_df <- temp_df %>% select("SampleID", "Species", "Marker", "Sequence")
+  
+  # Bind back to df
+  global_fungi_sequences <- bind_rows(global_fungi_sequences, temp_df)
+  
+  print(unique(temp_df$Species))
+  
+}
+
+# Filter if European by the permanent id and if it exists in metadata df
+global_fungi_sequences <- global_fungi_sequences %>% filter(SampleID %in% global_fungi_metadata$permanent_id)
+global_fungi_sequences <- unique(global_fungi_sequences)
+
+# Create metadata for countries
+global_fungi_metadata_lichen <- global_fungi_sequences %>% select(SampleID, Species)
+
+# Join to metadata
+global_fungi_metadata_lichen <- global_fungi_metadata_lichen %>% left_join(global_fungi_metadata, by = join_by(SampleID == permanent_id))
+
+# reverse geocode
+global_fungi_metadata_lichen$country <- map.where(database="world", 
+                           global_fungi_metadata_lichen$longitude, global_fungi_metadata_lichen$latitude)
+
+# Extract before :
+global_fungi_metadata_lichen$country <- str_split_i(global_fungi_metadata_lichen$country, ":", 1)
+
+# Turn into summary df
+global_fungi_metadata_lichen_location <- global_fungi_metadata_lichen %>% group_by(Species, country) %>%
+  summarise(count = n())
+
+# NA returned for some
+global_fungi_metadata_lichen_location <- na.omit(global_fungi_metadata_lichen_location)
+
+# Get country key
+GF_country_key <- unique(select(global_fungi_metadata_lichen, SampleID, country))
+
+# Join country to sequence data and then filter for Europe
+global_fungi_sequences <- global_fungi_sequences %>% left_join(GF_country_key)
+
+# Filter by europe
+global_fungi_sequences <- global_fungi_sequences %>% filter(country %in% euro_countries)
+
+# write.csv(global_fungi_sequences, "Databases/Global_Fungi/Final_GF_euro_sequences.csv")
+
+```
+
+# Name Change Function
+```{r}
+fix_names <- function(sequence_df, names_df) {
+  
+  # 1) Summarize names_df so each old_name has a list of new_names
+  map_summarized <- names_df %>%
+    group_by(old_name) %>%
+    summarize(new_names = list(unique(new_name)), .groups = "drop")
+  
+  # 2) Join onto sequence_df
+  df_joined <- sequence_df %>%
+    left_join(map_summarized, by = c("species" = "old_name"))
+  # This yields a 'new_names' list-column for each row in sequence_df.
+  
+  # 3) Define your custom logic for one row
+  fix_species_one_row <- function(species_val, seq_val, possible_new) {
+    # CASE A: No match => keep original
+    if (is.null(possible_new) || all(is.na(possible_new))) {
+      return(tibble(species = species_val, sequence = seq_val))
+    }
+    
+    # CASE B: Exactly 1 new name
+    if (length(possible_new) == 1) {
+      if (possible_new == species_val) {
+        # same as old => no change
+        return(tibble(species = species_val, sequence = seq_val))
+      } else {
+        # single new name => replace
+        return(tibble(species = possible_new, sequence = seq_val))
+      }
+    }
+    
+    # CASE C: Multiple new names
+    # If all new names == old => no change
+    if (all(possible_new == species_val)) {
+      return(tibble(species = species_val, sequence = seq_val))
+    }
+    
+    # There's at least one new name different from the old:
+    if (species_val %in% possible_new) {
+      # Mixture of old + new => keep old
+      return(tibble(species = species_val, sequence = seq_val))
+    } else {
+      # True split => remove this row entirely
+      return(tibble())  # returns zero rows
+    }
+  }
+  
+  # 4) Apply fix_species_one_row to each row
+  df_fixed <- df_joined %>%
+    mutate(
+      fixed = pmap(
+        list(species, sequence, new_names),
+        ~ fix_species_one_row(..1, ..2, ..3)
+      )
+    ) %>%
+    # Remove the original columns we no longer need:
+    select(-species, -sequence, -new_names) %>%
+    # Expand the list-column
+    unnest(cols = fixed)
+  
+  # 5) Return the final cleaned dataframe
+  return(df_fixed)
+}
+```
+
+## Load and Merge sequence data
+### BOLD, UNITE, and Global Fungi
+```{r}
+# BOLD
+#bold <- read.csv("Databases/BOLD/BOLD_sequences_final.csv", row.names = "X")
+bold <- BOLD_seq_euro # if contiuning from same script
+bold <- dplyr::rename(bold, Sequence = sequence)
+bold$Database <- "BOLD"
+
+# GF 
+# gf <- read.csv("Databases/Global_Fungi/Final_GF_euro_sequences.csv", row.names = "X")
+gf <- global_fungi_sequences
+gf$Database <- "Global Fungi"
+gf <- unique(gf)
+
+# UNITE
+# unite <- read.csv("Databases/UNITE/Lichen_sequences_UNITE_europe.csv", row.names = "X")
+unite <- SH_unite_expanded
+unite$Database <- "UNITE"
+
+# All data
+all_sequences <- bind_rows(unite, gf, bold) %>% select(-SH)
+all_sequences$Sequence <- trimws(all_sequences$Sequence)
+
+# Filter out those without ITS1 or ITS2
+invalid_markers <- c("18S", "28S", "LSU rDNA", "mtSSU", "nucLSU")
+
+# Filter the dataframe to keep only rows with valid ITS markers
+all_sequences <- all_sequences %>%
+  filter(!Marker %in% invalid_markers)
+
+# Replace dashes with 'N' (or you can remove them by using an empty string "")
+all_sequences$Sequence <- gsub("-", "", all_sequences$Sequence)
+
+# Replace all ambiguous characters with 'N'
+all_sequences$Sequence <- gsub("[^ATCGNatcgn]", "N", all_sequences$Sequence)
+
+# Remove parentheses and their contents from the headers
+all_sequences$SampleID <- gsub("\\(.*\\)", "", all_sequences$SampleID)
+
+# Trim any extra spaces that might have been introduced
+all_sequences$SampleID <- trimws(all_sequences$SampleID)
+
+```
+
+### Add Martin7
+```{r}
+# Read the FASTA file
+martin <- readDNAStringSet("Databases/Martin7/Martin7_ITS.fas")
+
+# Read in metadata
+martin_meta <- read_excel("Databases/Martin7/Martin7_metadata.xlsx")
+
+# Extract headers and sequences
+martin_df <- data.frame(headers = names(martin), sequences = as.character(martin))
+
+# Reset rownames
+row.names(martin_df) <- NULL
+
+# split unique ID and species name
+martin_df$SampleID <- str_split_i(martin_df$headers, "_", -1)
+
+# Remove those that are just to genus
+martin_df <- filter(martin_df, !grepl("sp.", headers))
+martin_df <- filter(martin_df, !grepl("unidentified", headers))
+
+# Remove aff., cf., unidentified,  and other odd characters for simplicity
+martin_df$headers <- gsub("_cf.|_aff.|_(sensu_Sipman)|_TYPE1|_TYPE2|_TYPE3|_2|_var._flavicans|_var._isidiata|_var._muscorum", "", martin_df$headers)
+
+# Create species column
+martin_df$Species <- paste0(str_split_i(martin_df$headers, "_", 1), " ", str_split_i(martin_df$headers, "_", 2))
+
+# Add NR_ to beginning of these
+martin_df[c(1086, 877, 1271, 829, 288, 294, 1170), 3] <- paste0("NR_", martin_df[c(1086, 877, 1271, 829, 288, 294, 1170), 3])
+
+# Filter for UK species
+martin_df <- unique(rbind(martin_df %>% filter(Species %in% names$old_name), martin_df %>% filter(Species %in% names$new_name)))
+
+martin_df %>% dplyr::filter(Species %in% names$old_name)
+
+# Check if there are missing Sample IDs in sequence file (T = 173, F = 824)
+table(martin_df$SampleID %in% all_sequences$SampleID)
+
+# Join metadata for country
+martin_df <- martin_df %>% left_join(select(martin_meta, `ITS accession`, Origin), by = join_by(SampleID == `ITS accession`))
+
+# Remove those without country
+martin_df <- na.omit(martin_df)
+
+# Replace with consistent country names
+martin_df$Origin <- gsub(".*Netherlands.*", "Netherlands", martin_df$Origin)
+martin_df$Origin <- gsub(".*Russia.*", "Russia", martin_df$Origin)
+martin_df$Origin <- gsub(".*Austria.*", "Austria", martin_df$Origin)
+martin_df$Origin <- gsub(".*Sweden.*", "Sweden", martin_df$Origin)
+martin_df$Origin <- gsub(".*Norway.*", "Norway", martin_df$Origin)
+martin_df$Origin <- gsub(".*Great Britain.*", "United Kingdom", martin_df$Origin)
+martin_df$Origin <- gsub(".*Ukraine.*", "Ukraine", martin_df$Origin)
+martin_df$Origin <- gsub(".*Poland.*", "Poland", martin_df$Origin)
+martin_df$Origin <- gsub(".*Greece.*", "Greece", martin_df$Origin)
+martin_df$Origin <- gsub(".*USA.*|Hawaii", "USA", martin_df$Origin)
+martin_df$Origin <- gsub(".*Korea.*", "Korea", martin_df$Origin)
+martin_df$Origin <- gsub(".*Japan.*", "Japan", martin_df$Origin)
+martin_df$Origin <- gsub(".*Spain.*", "Spain", martin_df$Origin)
+martin_df$Origin <- gsub(".*Portugal.*", "Portugal", martin_df$Origin)
+martin_df$Origin <- gsub(".*China.*", "China", martin_df$Origin)
+martin_df$Origin <- gsub(".*Canada.*", "Canada", martin_df$Origin)
+martin_df$Origin <- gsub("N/A|NA", NA, martin_df$Origin)
+martin_df <- na.omit(martin_df)
+
+# Just European Countries
+euro_countries <- c("Russia", 'Germany', "United Kingdom", "France", "Italy", "Spain", "Poland", "Ukraine", "Romania", "Netherlands", "Belgium", "Czech Republic", "Sweden", "Portugal", "Greece", "Hungary", "Austria", "Belarus", "Switzerland", "Bulgaria", "Serbia", "Denmark", "Finland", "Norway", "Slovakia", "Ireland", "Croatia", "Bosnia and Herzegovina", "Moldova", "Lithuania", "Albania", "Slovenia", "Latvia", "North Macedonia", "Estonia", "Luxembourg", "Montenegro", "Malta", "Iceland", "Andorra", "Liechtenstein", "Monaco", "San Marino", "Holy See")
+
+# Select only european countries
+martin_df <- martin_df %>%
+  filter(Origin %in% euro_countries)
+
+# Look at species
+table(martin_df$Species %in% all_sequences$Species)
+# 207 new species
+
+# Join to other dataset
+martin_df$Marker <- "ITS"
+martin_df$Database <- "Martin7"
+martin_df <- martin_df %>% dplyr::rename(Sequence = sequences, country = Origin) %>% select(-headers)
+
+all_sequences <- rbind(all_sequences, martin_df)
+
+```
+
+### Summarize and create ITS DF
+```{r}
+# Prepare for name chage
+its_seq <- all_sequences %>% select(Species, Sequence, Database, country, Marker) %>%
+  dplyr::rename(species = Species, sequence = Sequence)
+
+#hist(nchar(all_sequences$Sequence), breaks = 1000, xlim = c(130,220))
+
+all_sequences$length <- nchar(all_sequences$Sequence)
+
+all_sequences$clean_marker <- gsub("5.8S, ITS1, ITS2|5.8S, ITS2, ITS1|ITS1, 5.8S, ITS2|ITS1, 5.8S, ITS2, LSU D1, LSU D2|ITS1, ITS2, 5.8S|ITS2, 5.8S, ITS1|ITS1, ITS2|ITS2, ITS1, 5.8S|ITS2, 5.8S, ITS1, LSU rDNA", "ITS", all_sequences$Marker)
+
+all_sequences$clean_marker <- gsub("ITS, LSU rDNA|ITS, SSU rDNA", "ITS", all_sequences$clean_marker)
+
+all_sequences$sequence <- all_sequences$Sequence
+all_sequences$species <- all_sequences$Species
+
+# all_sequences <- unique(fix_names(all_sequences, names))
+
+# fix names
+its_seq <- unique(fix_names(its_seq, names))
+
+# take top 100 records
+its_seq <- its_seq %>%
+  mutate(Sequence_Length = nchar(sequence))
+
+species_counts <- its_seq %>%
+  count(species, name = "Occurrences")
+
+# Identify species with more than 100 records
+species_to_downsample <- species_counts %>%
+  filter(Occurrences > 200) %>%
+  pull(species)
+
+# Keep 100 longest sequences for species with >100 records
+its_seq <- its_seq %>%
+  group_by(species) %>%
+  filter(species %in% species_to_downsample) %>%              # Select overrepresented species
+  slice_max(Sequence_Length, n = 200, with_ties = FALSE) %>%  # Keep top 100 longest sequences
+  ungroup() %>%
+  bind_rows(                                                  # Add back species with <=100 records
+    its_seq %>% filter(!(species %in% species_to_downsample))
+  ) %>% select(-Sequence_Length)
+
+# Generate unique 6-digit codes
+set.seed(123)  # Set seed for reproducibility
+num_codes <- nrow(its_seq)
+its_seq$unique_code <- paste0("BL", sprintf("%06d", sample(1e5:999999, num_codes, replace = FALSE)))
+
+its_seq$Species_code <- gsub(" ", "_", its_seq$species)
+
+its_seq$header <- paste(its_seq$unique_code, its_seq$Species_code, sep = "|")
+
+# Create the DNAStringSet object
+dna_sequences <- DNAStringSet(its_seq$sequence)
+
+# Assign the names (headers) to the sequences
+names(dna_sequences) <- its_seq$header
+
+# Write the sequences to a FASTA file
+# writeXStringSet(dna_sequences, filepath="Databases/BLITS/Final/BLITS_ITS.fasta", format="fasta")
+
+```
+
+#### Write and read in ITS
+```{r}
+# write.csv(its_seq, "Databases/BLITS/its_seq_full.csv")
+
+its_seq <- read.csv("Databases/BLITS/its_seq_full.csv", row.names = "X")
+
+```
+
+# nucLSU
+## GenBank nucLSU
+```{r}
+library(gbfetch)
+nucLSU <- genbank_metadata %>% filter(nucLSU == 1)
+
+ncbi_api_key = ""
+Sys.setenv(ENTREZ_KEY = ncbi_api_key)
+
+convert_to_bases <- function(numeric_sequence) {
+  # Define the mapping vector
+  mapping <- c("18" = "A", "28" = "C", "48" = "G", "88" = "T")
+  # Convert numeric codes to characters using the mapping
+  bases <- sapply(numeric_sequence, function(x) mapping[as.character(x)])
+  # Collapse into a single string if desired
+  sequence_string <- paste(bases, collapse = "")
+  return(sequence_string)
+}
+
+nucLSU_seq <- data.frame()
+for (i in 1:nrow(nucLSU)){
+  fetch_temp <- fetch_sequences(nucLSU$accession[i], simple_names = T)
+  converted_sequence <- convert_to_bases(fetch_temp[[1]])
+  temp_df <- data.frame(accession = nucLSU$accession[i], species = nucLSU$species[i], sequence = converted_sequence, country = nucLSU$country[i])
+  nucLSU_seq <- bind_rows(nucLSU_seq, temp_df)
+  cat(i, " of ", nrow(nucLSU), "\n")
+}
+
+nucLSU_gb <- read.csv("Databases/genbank/nucLSU_seq_genbank.csv", row.names = "X")
+
+nucLSU_gb$species <- gsub("\\]", "", nucLSU_gb$species)
+nucLSU_gb$species <- gsub("\\[", "", nucLSU_gb$species)
+
+nucLSU_gb$Database <- "GenBank"
+
+# Name Replace
+nucLSU_gb <- nucLSU_gb %>% filter(species %in% unique(names$old_name, names$new_name))
+nucLSU_gb <- unique(fix_names(nucLSU_gb, names))
+
+# Generate unique 6-digit codes
+set.seed(123)  # Set seed for reproducibility
+num_codes <- nrow(nucLSU_gb)
+nucLSU_gb$unique_code <- paste0("BL", sprintf("%06d", sample(1e5:999999, num_codes, replace = FALSE)))
+
+nucLSU_gb$Species_code <- gsub(" ", "_", nucLSU_gb$species)
+
+nucLSU_gb$header <- paste(nucLSU_gb$unique_code, nucLSU_gb$Species_code, sep = "|")
+
+# Create the DNAStringSet object
+dna_sequences <- DNAStringSet(nucLSU_gb$sequence)
+
+# Assign the names (headers) to the sequences
+names(dna_sequences) <- nucLSU_gb$header
+
+# write.csv(nucLSU_gb, "Databases/genbank/nucLSU_seq_genbank.csv")
+# Write the sequences to a FASTA file
+# writeXStringSet(dna_sequences, filepath="Databases/BLITS/Final/BLRD_nucLSU.fasta", format="fasta")
+
+nuclsu_comb <- nucLSU_gb
+
+```
+
+# nucSSU
+## GenBank mtSSU
+```{r}
+
+nucSSU <- genbank_metadata %>% filter(nucSSU == 1)
+ncbi_api_key = ""
+Sys.setenv(ENTREZ_KEY = ncbi_api_key)
+
+nucSSU_seq <- data.frame()
+for (i in 1:nrow(nucSSU)){
+  fetch_temp <- fetch_sequences(nucSSU$accession[i], simple_names = T)
+  converted_sequence <- convert_to_bases(fetch_temp[[1]])
+  temp_df <- data.frame(accession = nucSSU$accession[i], species = nucSSU$species[i], sequence = converted_sequence, country = nucSSU$country[i])
+  nucSSU_seq <- bind_rows(nucSSU_seq, temp_df)
+  cat(i, " of  ", nrow(nucSSU), "\n")
+}
+
+# write.csv(nucSSU_seq, "Databases/genbank/nucSSU_seq_genbank.csv")
+nucSSU_seq <- read.csv("Databases/genbank/nucSSU_seq_genbank.csv", row.names = "X")
+
+# Fix weird characters
+nucSSU_seq$species <- gsub("\\]", "", nucSSU_seq$species)
+nucSSU_seq$species <- gsub("\\[", "", nucSSU_seq$species)
+
+nucSSU_seq$Database <- "GenBank"
+
+# Name Replace
+nucSSU_seq <- nucSSU_seq %>% filter(species %in% unique(names$old_name, names$new_name))
+nucSSU_seq <- unique(fix_names(nucSSU_seq, names))
+nucSSU_seq <- na.omit(nucSSU_seq)
+
+# Generate unique 6-digit codes
+set.seed(123)  # Set seed for reproducibility
+num_codes <- nrow(nucSSU_seq)
+nucSSU_seq$unique_code <- paste0("BL", sprintf("%06d", sample(1e5:999999, num_codes, replace = FALSE)))
+
+nucSSU_seq$Species_code <- gsub(" ", "_", nucSSU_seq$species)
+
+nucSSU_seq$header <- paste(nucSSU_seq$unique_code, nucSSU_seq$Species_code, sep = "|")
+
+# Create the DNAStringSet object
+dna_sequences <- DNAStringSet(nucSSU_seq$sequence)
+
+# Assign the names (headers) to the sequences
+names(dna_sequences) <- nucSSU_seq$header
+
+# Fix weird characters
+nucSSU_seq$species <- gsub("\\]", "", nucSSU_seq$species)
+nucSSU_seq$species <- gsub("\\[", "", nucSSU_seq$species)
+
+nucSSU_seq$Database <- "GenBank"
+
+# Name Replace
+nucSSU_seq <- nucSSU_seq %>% filter(species %in% unique(names$old_name, names$new_name))
+nucSSU_seq <- unique(fix_names(nucSSU_seq, names))
+nucSSU_seq <- na.omit(nucSSU_seq)
+
+# Generate unique 6-digit codes
+set.seed(123)  # Set seed for reproducibility
+num_codes <- nrow(nucSSU_seq)
+nucSSU_seq$unique_code <- paste0("BL", sprintf("%06d", sample(1e5:999999, num_codes, replace = FALSE)))
+
+nucSSU_seq$Species_code <- gsub(" ", "_", nucSSU_seq$species)
+
+nucSSU_seq$header <- paste(nucSSU_seq$unique_code, nucSSU_seq$Species_code, sep = "|")
+
+# write.csv(nucSSU_seq, "Databases/genbank/nucSSU_seq_genbank.csv")
+
+# Create the DNAStringSet object
+dna_sequences <- DNAStringSet(nucSSU_seq$sequence)
+
+# Assign the names (headers) to the sequences
+names(dna_sequences) <- nucSSU_seq$header
+
+# Write the sequences to a FASTA file
+# writeXStringSet(dna_sequences, filepath="Databases/BLITS/Final/BLRD_nuclsu.fasta", format="fasta")
+
+```
+
+# mtSSU
+## GenBank mtSSU
+```{r}
+
+mtSSU <- genbank_metadata %>% filter(mtSSU == 1)
+ncbi_api_key = ""
+Sys.setenv(ENTREZ_KEY = ncbi_api_key)
+
+mtSSU_seq <- data.frame()
+for (i in 1:nrow(mtSSU)){
+  fetch_temp <- fetch_sequences(mtSSU$accession[i], simple_names = T)
+  converted_sequence <- convert_to_bases(fetch_temp[[1]])
+  temp_df <- data.frame(accession = mtSSU$accession[i], species = mtSSU$species[i], sequence = converted_sequence)
+  mtSSU_seq <- bind_rows(mtSSU_seq, temp_df)
+  cat(i, " of 5599 ", "\n")
+}
+
+# write.csv(mtSSU_gb, "Databases/genbank/mtSSU_seq_genbank.csv")
+mtSSU_gb <- read.csv("Databases/genbank/mtSSU_seq_genbank.csv", row.names = "X")
+
+```
+
+## Martin7
+```{r}
+# Read the FASTA file
+martin <- readDNAStringSet("Databases/Martin7/Martin7_mtSSU.fas")
+
+# Read in metadata
+martin_meta <- read_excel("Databases/Martin7/Martin7_metadata.xlsx")
+
+# Extract headers and sequences
+martin_df <- data.frame(headers = names(martin), sequences = as.character(martin))
+
+# Reset rownames
+row.names(martin_df) <- NULL
+
+# split unique ID and species name
+martin_df$SampleID <- str_split_i(martin_df$headers, "_", -1)
+
+# Remove those that are just to genus
+martin_df <- filter(martin_df, !grepl("sp.", headers))
+martin_df <- filter(martin_df, !grepl("unidentified", headers))
+
+# Remove aff., cf., unidentified,  and other odd characters for simplicity
+martin_df$headers <- gsub("_cf.|_aff.|_(sensu_Sipman)|_TYPE1|_TYPE2|_TYPE3|_2|_var._flavicans|_var._isidiata|_var._muscorum", "", martin_df$headers)
+
+martin_df <- martin_df %>%
+  filter(str_count(headers, "_") != 1)
+
+# Create species column
+martin_df$Species <- paste0(str_split_i(martin_df$headers, "_", 1), " ", str_split_i(martin_df$headers, "_", 2))
+
+# Filter for UK species
+martin_df <- unique(rbind(martin_df %>% filter(Species %in% names$old_name), martin_df %>% filter(Species %in% names$new_name)))
+
+# Join metadata for country
+martin_df <- martin_df %>% left_join(select(martin_meta, `mtSSU accession`, Origin), by = join_by(SampleID == `mtSSU accession`))
+
+# Remove those without country
+martin_df <- na.omit(martin_df)
+
+# Replace with consistent country names
+martin_df$Origin <- gsub(".*Netherlands.*", "Netherlands", martin_df$Origin)
+martin_df$Origin <- gsub(".*Russia.*", "Russia", martin_df$Origin)
+martin_df$Origin <- gsub(".*Austria.*", "Austria", martin_df$Origin)
+martin_df$Origin <- gsub(".*Sweden.*", "Sweden", martin_df$Origin)
+martin_df$Origin <- gsub(".*Norway.*", "Norway", martin_df$Origin)
+martin_df$Origin <- gsub(".*Great Britain.*", "United Kingdom", martin_df$Origin)
+martin_df$Origin <- gsub(".*Ukraine.*", "Ukraine", martin_df$Origin)
+martin_df$Origin <- gsub(".*Poland.*", "Poland", martin_df$Origin)
+martin_df$Origin <- gsub(".*Greece.*", "Greece", martin_df$Origin)
+martin_df$Origin <- gsub(".*USA.*|Hawaii", "USA", martin_df$Origin)
+martin_df$Origin <- gsub(".*Korea.*", "Korea", martin_df$Origin)
+martin_df$Origin <- gsub(".*Japan.*", "Japan", martin_df$Origin)
+martin_df$Origin <- gsub(".*Spain.*", "Spain", martin_df$Origin)
+martin_df$Origin <- gsub(".*Portugal.*", "Portugal", martin_df$Origin)
+martin_df$Origin <- gsub(".*China.*", "China", martin_df$Origin)
+martin_df$Origin <- gsub(".*Canada.*", "Canada", martin_df$Origin)
+martin_df$Origin <- gsub("N/A|NA", NA, martin_df$Origin)
+martin_df <- na.omit(martin_df)
+
+# Just European Countries
+euro_countries <- c("Russia", 'Germany', "United Kingdom", "France", "Italy", "Spain", "Poland", "Ukraine", "Romania", "Netherlands", "Belgium", "Czech Republic", "Sweden", "Portugal", "Greece", "Hungary", "Austria", "Belarus", "Switzerland", "Bulgaria", "Serbia", "Denmark", "Finland", "Norway", "Slovakia", "Ireland", "Croatia", "Bosnia and Herzegovina", "Moldova", "Lithuania", "Albania", "Slovenia", "Latvia", "North Macedonia", "Estonia", "Luxembourg", "Montenegro", "Malta", "Iceland", "Andorra", "Liechtenstein", "Monaco", "San Marino", "Holy See")
+
+# Select only european countries
+martin_df <- martin_df %>%
+  filter(Origin %in% euro_countries)
+
+# Look at species
+#table(martin_df$Species %in% all_sequences$Species)
+# 207 new species
+
+# Join to other dataset
+martin_df$Marker <- "mtSSU"
+martin_df$Database <- "Martin7"
+martin_df <- martin_df %>% dplyr::rename(sequence = sequences, species = Species, country = Origin) %>% select(-headers, -SampleID, -Marker, -Database)
+
+martin_df$Database <- "Martin7"
+
+```
+
+### Combine mtSSU
+```{r}
+mtSSU_gb <- read.csv("Databases/genbank/mtSSU_seq_genbank.csv", row.names = "X")
+
+# Fix weird characters
+mtSSU_gb$species <- gsub("\\]", "", mtSSU_gb$species)
+mtSSU_gb$species <- gsub("\\[", "", mtSSU_gb$species)
+
+mtSSU_gb$Database <- "GenBank"
+
+# Bind data
+mtssu_comb <- mtSSU_gb %>% select(-accession) %>% 
+  bind_rows(martin_df)
+
+# Name Replace
+mtssu_comb <- mtssu_comb %>% filter(species %in% unique(names$old_name, names$new_name))
+mtssu_comb <- unique(fix_names(mtssu_comb, names))
+mtssu_comb <- na.omit(mtssu_comb)
+
+# Generate unique 6-digit codes
+set.seed(123)  # Set seed for reproducibility
+num_codes <- nrow(mtssu_comb)
+mtssu_comb$unique_code <- paste0("BL", sprintf("%06d", sample(1e5:999999, num_codes, replace = FALSE)))
+
+mtssu_comb$Species_code <- gsub(" ", "_", mtssu_comb$species)
+
+mtssu_comb$header <- paste(mtssu_comb$unique_code, mtssu_comb$Species_code, sep = "|")
+
+# Create the DNAStringSet object
+dna_sequences <- DNAStringSet(mtssu_comb$sequence)
+
+# Assign the names (headers) to the sequences
+names(dna_sequences) <- mtssu_comb$header
+
+# Write the sequences to a FASTA file
+# writeXStringSet(dna_sequences, filepath="Databases/BLITS/Final/BLRD_mtssu.fasta", format="fasta")
+
+```
+
+# Create Tax File
+```{r}
+
+ncbi_api_key = ""
+Sys.setenv(ENTREZ_KEY = ncbi_api_key)
+
+# Example: Retrieve taxonomy for a list of species names
+species_names <- unique(c(names$new_name))
+databases <- c("ncbi", "itis", "gbif", "col")
+
+# Initialize an empty list to store results
+taxonomy_results <- list()
+
+species_names <- data.frame(species_names)
+
+#species_names <- species_names %>% filter(species_names %in% rerun$full_ITS_species_list)
+
+# Loop over each species
+for (species in species_names$species_names) {
+  found <- FALSE
+  
+  # Loop through each database until a match is found
+  for (db in databases) {
+    # Try to get the classification
+    result <- tryCatch({
+      if (db == "ncbi") {
+        classification(species, db = db, key = ncbi_api_key, rows = 1)
+      } else {
+        classification(species, db = db, rows = 1)
+      }
+    }, error = function(e) NULL)
+    
+    # Check if result is valid and not NULL or an atomic vector
+    if (is.list(result) && !is.null(result[[1]]) && "name" %in% names(result[[1]])) {
+      # Store the result and mark it as found
+      taxonomy_results[[species]] <- data.frame(Species = species, 
+                                                Taxonomy = paste(result[[1]]$name, collapse = "; "), 
+                                                Database = db)
+      found <- TRUE
+      break  # Exit the inner loop once a match is found
+    }
+  }
+  
+  # If not found in any database, add a 'Not found' entry
+  if (!found) {
+    taxonomy_results[[species]] <- data.frame(Species = species, Taxonomy = NA, Database = "Not found")
+  }
+}
+
+# Combine results into a single data frame
+taxonomy_results_df <- do.call(rbind, taxonomy_results)
+
+# write.csv(taxonomy_results_df, "taxonomy_all_british_lichen.csv")
+
+```
+
+## Manual curation of tax file
+```{r}
+
+# Read your taxonomy files
+myco_tax <- read.csv("Taxonomy/taxonomy_all_british_lichen.csv")
+photo_tax <- read.csv("Taxonomy/taxonomy_chlorophyta.csv")
+
+# Myco
+# Pre-allocate the dataframe with the correct number of rows
+tax_df <- data.frame(
+  kingdom = character(nrow(myco_tax)),
+  phylum = character(nrow(myco_tax)),
+  class = character(nrow(myco_tax)),
+  order = character(nrow(myco_tax)),
+  family = character(nrow(myco_tax)),
+  genus = character(nrow(myco_tax)),
+  species = character(nrow(myco_tax)),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each row of myco_tax
+for (i in 1:nrow(myco_tax)) {
+  
+  # Print the progress
+  print(i)
+  
+  # Extract components
+  components <- strsplit(myco_tax$Taxonomy[i], ";")[[1]] %>% trimws()
+  
+  # Extract groups based on the rules, assigning NA if no match is found
+  tax_df$kingdom[i] <- "Fungi" # Always "Fungi"
+  tax_df$phylum[i] <- ifelse(length(components[grepl("mycota$", components)]) > 0, 
+                             components[grepl("mycota$", components)][1], NA)
+  tax_df$class[i] <- ifelse(length(components[grepl("mycetes$", components)]) > 0, 
+                            components[grepl("mycetes$", components)][1], NA)
+  tax_df$order[i] <- ifelse(length(components[grepl("ales$", components)]) > 0, 
+                            components[grepl("ales$", components)][1], NA)
+  tax_df$family[i] <- ifelse(length(components[grepl("aceae$", components)]) > 0, 
+                             components[grepl("aceae$", components)][1], NA)
+  tax_df$genus[i] <- ifelse(length(components) >= 2, components[length(components) - 1], NA)
+  tax_df$species[i] <- ifelse(length(components) >= 1, components[length(components)], NA)
+}
+
+# Manual curation of several that didn't load
+tax_df[321, ] <- c("Fungi", "Ascomycota", "Lecanoromycetes", "Pertusariales", "Megasporaceae", "Circinaria", "Circinaria tuberculosa")
+tax_df[1267, ] <- c("Fungi", "Ascomycota", "Lecanoromycetes", "Ostropales", "Graphidaceae", "Graphis", "Graphis persoonii")
+tax_df[1327, ] <- c("Fungi", "Ascomycota", "Lecanoromycetes", "Rhizocarpales", "Rhizocarpaceae", "Haugania", "Haugania oederi")
+tax_df[1408, ] <- c("Fungi", "Ascomycota", "Lecanoromycetes", "Ostropales", "Stictidaceae", "Karstenia", "Karstenia chrysophaea")
+tax_df[1409, ] <- c("Fungi", "Ascomycota", "Lecanoromycetes", "Ostropales", "Stictidaceae", "Karstenia", "Karstenia dictyospora")
+tax_df[1410, ] <- c("Fungi", "Ascomycota", "Lecanoromycetes", "Ostropales", "Stictidaceae", "Karstenia", "Karstenia nigra")
+tax_df[1410, ] <- c("Fungi", "Ascomycota", "Lecanoromycetes", "Ostropales", "Stictidaceae", "Karstenia", "Karstenia nigra")
+tax_df[2320, ] <- c("Fungi", "Ascomycota", "Lecanoromycetes", NA, NA, "Randlanea", "Randlanea usneicola")
+tax_df[1188, ] <- c("Fungi", "Ascomycota", "Lecanoromycetes", "Lecanorales", "Pilocarpaceae", "Epicladonia", "Epicladonia simplex")
+tax_df[1189, ] <- c("Fungi", "Ascomycota", "Lecanoromycetes", "Lecanorales", "Pilocarpaceae", "Epicladonia", "Epicladonia stenospora")
+tax_df[2516, ] <- c("Fungi", "Ascomycota", "Dothideomycetes", "Asterotexales", NA, "Taeniolella", "Taeniolella punctata")
+tax_df[2518, ] <- c("Fungi", "Ascomycota", "Dothideomycetes", "Asterotexales", NA, "Taeniolella", "Taeniolella toruloides")
+tax_df[58, ] <- c("Fungi", "Ascomycota", "Dothideomycetes", "Monoblastiales", "Monoblastiaceae", "Acrocordia", "Acrocordia cavata")
+tax_df[59, ] <- c("Fungi", "Ascomycota", "Dothideomycetes", "Monoblastiales", "Monoblastiaceae", "Acrocordia", "Acrocordia conoidea")
+tax_df[63, ] <- c("Fungi", "Ascomycota", "Dothideomycetes", "Monoblastiales", "Monoblastiaceae", "Acrocordia", "Acrocordia subglobosa")
+tax_df[64, ] <- c("Fungi", "Ascomycota", "Dothideomycetes", "Asterinales", "Stictographaceae", "Actinocladium", "Actinocladium rhodosporum")
+tax_df[206, 5] <- "Chrysothricaceae"
+tax_df[241, 3:5] <- c("Dothideomycetes", "Pleosporales", "Arthopyreniaceae")
+
+# Algae and cyanobacteria
+tax_df <- tax_df[-c(1707, 1712, 1718), ]
+
+# Create the mapping table from the original tax_df
+genus_mapping <- tax_df %>%
+  select(kingdom, phylum, class, order, family, genus) %>%
+  distinct()
+
+genus_mapping <- na.omit(genus_mapping)
+genus_mapping$family <- gsub("Byssolomataceae", "Pilocarpaceae", genus_mapping$family)
+
+# Manually add in some missing
+Fulgensia <- data.frame(kingdom = "Fungi", phylum = "Ascomycota", class = "Lecanoromycetes", order = "Teloschistales", family = "Teloschistaceae", genus = "Fulgensia")
+Secoliga <- data.frame(kingdom = "Fungi", phylum = "Ascomycota", class = "Lecanoromycetes", order = "Gyalectales", family = "Gyalectaceae", genus = "Secoliga")
+Stictographa <- data.frame(kingdom = "Fungi", phylum = "Ascomycota", class = "Dothideomycetes", order = "Asterotexales", family = "Stictographaceae", genus = "Stictographa")
+Burgoa <- data.frame(kingdom = "Fungi", phylum = "Basidiomycota", class = "Agaricomycetes", order = "Cantharellales", family = "Hydnaceae", genus = "Burgoa")
+Illosporiopsis <- data.frame(kingdom = "Fungi", phylum = "Ascomycota", class = "Sordariomycetes", order = "Hypocreales", family = "Hypocreales_family_incertae_sedis", genus = "Illosporiopsis")
+Bachmanniomyces <- data.frame(kingdom = "Fungi", phylum = "Ascomycota", class = "Sordariomycetes", order = "Pezizomycotina_order_incertae_sedis", family = "Pezizomycotina_family_incertae_sedis", genus = "Bachmanniomyces")
+Hemigrapha <- data.frame(kingdom = "Fungi", phylum = "Ascomycota", class = "Dothideomycetes", order = "Asterinales", family = "Hemigraphaceae", genus = "Hemigrapha")
+Corticifraga <- data.frame(kingdom = "Fungi", phylum = "Ascomycota", class = "Lecanoromycetes", order = "Lecanorales", family = "Lecanoromycetes_family_incertae_sedis", genus = "Corticifraga")
+Clathroporinopsis <- data.frame(kingdom = "Fungi", phylum = "Ascomycota", class = "Lecanoromycetes", order = "Gyalectales", family = "Gyalectaceae", genus = "Clathroporinopsis")
+
+genus_mapping <- bind_rows(genus_mapping, Fulgensia, Secoliga, Stictographa, Burgoa, Illosporiopsis, Bachmanniomyces, Hemigrapha, Corticifraga, Clathroporinopsis)
+
+# Identify genera mapped to multiple families
+conflicting_genus <- genus_mapping %>%
+  group_by(genus) %>%
+  filter(n_distinct(family) > 1) %>%
+  arrange(genus)
+
+# Reset row names to match sequential indices
+genus_mapping <- genus_mapping %>% mutate(row_id = row_number())
+rownames(genus_mapping) <- NULL
+
+# Fix manually
+# Combine all row indices into a vector
+rows_to_remove <- c(92, 216, 224, 140, 387, 494, 134, 191, 524, 553, 
+                    523, 438, 505, 370, 28, 448, 182, 595, 219)
+
+# Remove all specified rows at once
+genus_mapping <- genus_mapping[-rows_to_remove, ]
+
+# Fix species names
+tax_df$sequence <- "test"
+tax_df <- fix_names(tax_df, names)
+tax_df <- tax_df %>% select(-sequence)
+
+# Manually add in some missing
+missing_sp <- data.frame(kingdom = NA, phylum = NA, class =  NA, order = NA, family = NA, genus = NA, species = unique(names$new_name))
+
+# Bind into tax_df
+tax_df <- bind_rows(tax_df, missing_sp)
+
+# Extract genus from the corrected species column
+tax_df <- tax_df %>%
+  mutate(genus = str_split_i(species, " ", 1))
+
+# Standardize genus column in both datasets
+tax_df <- tax_df %>%
+  mutate(genus = str_trim(genus))
+
+# Create the genus_mapping from tax_df
+genus_mapping_2 <- tax_df %>%
+  select(kingdom, phylum, class, order, family, genus) %>%
+  group_by(genus) %>%
+  summarise(
+    kingdom = head(na.omit(kingdom), 1),
+    phylum = head(na.omit(phylum), 1),
+    class = head(na.omit(class), 1),
+    order = head(na.omit(order), 1),
+    family = head(na.omit(family), 1),
+    .groups = "drop"
+  )
+
+# Step 2: Combine and ensure mapping is complete
+genus_mapping <- unique(bind_rows(genus_mapping, genus_mapping_2))
+
+genus_mapping <- genus_mapping %>%
+  mutate(genus = str_trim(genus))
+
+# Step 4: Join the mapping table to update all ranks
+tax_df <- tax_df %>%
+  left_join(genus_mapping, by = "genus", suffix = c("", "_updated"), relationship = "many-to-many") %>%
+  mutate(
+    kingdom = coalesce(kingdom_updated, kingdom),
+    phylum = coalesce(phylum_updated, phylum),
+    class = coalesce(class_updated, class),
+    order = coalesce(order_updated, order),
+    family = coalesce(family_updated, family)
+  ) %>%
+  select(-ends_with("_updated"))
+
+tax_df$family <- gsub("Byssolomataceae", "Pilocarpaceae", tax_df$family)
+
+tax_df <- tax_df %>% select(-row_id)
+tax_df <- unique(tax_df)
+tax_df <- tax_df %>% filter(!is.na(family))
+
+# Find genera in tax_df that are not in genus_mapping
+unmatched_genera <- tax_df %>%
+  filter(is.na(kingdom) | is.na(phylum) | is.na(class) | is.na(order) | is.na(family)) %>%
+  distinct(genus)
+
+print(unmatched_genera)
+
+entries_to_remove <- tibble(
+  kingdom = c(
+    "Fungi","Fungi","Fungi","Fungi","Fungi","Fungi","Fungi","Fungi",
+    "Fungi","Fungi","Fungi","Fungi","Fungi","Fungi","Fungi","Fungi",
+    "Fungi","Fungi","Fungi","Fungi","Fungi","Fungi","Fungi","Fungi",
+    "Fungi","Fungi","Fungi","Fungi","Fungi","Fungi","Fungi","Fungi",
+    "Fungi","Fungi","Fungi","Fungi","Fungi","Fungi","Fungi","Fungi",
+    "Fungi","Fungi","Fungi","Fungi","Fungi","Fungi",
+    "Fungi","Fungi","Fungi","Fungi","Fungi", "Fungi", "Fungi", "Fungi", "Fungi", "Fungi", "Fungi", "Fungi", "Fungi", "Fungi", "Fungi"
+  ),
+  phylum = c(
+    "Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota",
+    "Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota",
+    "Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota",
+    "Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota",
+    "Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota",
+    "Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota",
+    "Ascomycota","Ascomycota","Ascomycota","Ascomycota","Ascomycota", "Ascomycota", "Ascomycota", "Ascomycota", "Ascomycota", "Ascomycota", "Ascomycota", "Ascomycota", "Ascomycota", "Ascomycota", "Ascomycota"
+  ),
+  class = c(
+    "Dothideomycetes","Dothideomycetes","Lecanoromycetes","Lecanoromycetes","Lecanoromycetes","Dothideomycetes",
+    "Eurotiomycetes","Eurotiomycetes","Lecanoromycetes","Lecanoromycetes","Lecanoromycetes","Lecanoromycetes",
+    "Lecanoromycetes","Lecanoromycetes","Lecanoromycetes","Dothideomycetes","Lecanoromycetes","Lecanoromycetes",
+    "Lecanoromycetes","Lecanoromycetes","Eurotiomycetes","Lecanoromycetes","Lecanoromycetes","Lecanoromycetes",
+    "Lecanoromycetes","Lecanoromycetes","Lecanoromycetes","Dothideomycetes","Lecanoromycetes","Lecanoromycetes", "Lecanoromycetes","Lichinomycetes","Lecanoromycetes","Lecanoromycetes","Lecanoromycetes","Lecanoromycetes", "Lecanoromycetes","Lecanoromycetes","Dothideomycetes","Lecanoromycetes","Lecanoromycetes","Lecanoromycetes", "Lecanoromycetes","Dothideomycetes", "Dothideomycetes", "Eurotiomycetes", "Dothideomycetes", "Lecanoromycetes", "Lecanoromycetes", "Lichinomycetes", "Lecanoromycetes", "Dothideomycetes", "Leotiomycetes", "Leotiomycetes", "Lecanoromycetes", "Eurotiomycetes", "Lecanoromycetes", "Dothideomycetes", "Eurotiomycetes", "Dothideomycetes", "Dothideomycetes"
+  ),
+  order = c(
+    "Eremithallales","Pleosporales","Gyalectales","Teloschistales","Lecideales","Pleosporales",
+    "Sclerococcales","Sclerococcales","Gyalectales","Ostropales","Ostropales","Teloschistales",
+    "Teloschistales","Lecanorales","Ostropales","Lichenoconiales","Lecanorales","Lecanorales",
+    "Lecanorales","Lecanorales","Verrucariales","Lecanorales","Pertusariales","Gyalectales",
+    "Teloschistales","Teloschistales","Trapeliales","Pleosporales","Pertusariales","Lecanorales",
+    "Lichinales","Gyalectales","Teloschistales","Schaereriales","Ostropales","Sclerococcales",
+    "Lecanorales","Lecanorales","Capnodiales","Lecanorales","Caliciales","Lecanorales","Ostropales","Collemopsidiales", "Mycosphaerellales","Sclerococcales", "Collemopsidiales", "Lecanorales", "Teloschistales", "Lichinales", "Gyalectales", "Pleosporales", "Lecanorales", "Leotiales", "Lecideales", "Chaetothyriales", "Lecanorales", "Asterinales", "Verrucariales", "
+Dothideomycetes_order_incertae_sedis", "Asterotexales"
+  ),
+  family = c(
+    "Melaspileaceae","Arthopyreniaceae","Gyalectaceae","Physciaceae","Lecideaceae","Arthopyreniaceae",
+    "Dactylosporaceae","Dactylosporaceae","Gyalectaceae","Graphidaceae","Graphidaceae","Leprocaulaceae",
+    "Physciaceae","Hymeneliaceae","Graphidaceae","Lichenoconiaceae","Ectolechiaceae","Sarrameanaceae",
+    "Micareaceae","Helocarpaceae","Verrucariaceae","Ramalinaceae","Pertusariaceae","Gyalectaceae",
+    "Physciaceae","Physciaceae","Trapeliaceae","Dacampiaceae","Pertusariaceae","Sphaerophoraceae",
+    "Lichinaceae","Gyalectaceae","Physciaceae","Schaereriaceae","Sagiolechiaceae","Sclerococcaceae",
+    "Lecanoraceae","Pilocarpaceae","Mycosphaerellaceae","Lecanoraceae","Physciaceae","Vezdaeaceae",
+    "Graphidaceae","Xanthopyreniaceae", "Mycosphaerellaceae", "Sclerococcaceae", "Xanthopyreniaceae", "Catillariaceae", "Physciaceae", "Lichinaceae", "Gyalectaceae", "Abrothallaceae", "Pilocarpaceae", "Mniaeciaceae", "Lecideaceae", "Verrucariaceae", "Melaspileaceae", "Melaspileaceae", "Verrucariaceae", "Pyrenidiaceae", "Mytilinidiaceae"
+  ),
+  genus = c(
+    "Arthonia","Arthopyrenia","Belonia","Buellia","Calvitimela","Collemopsidium",
+    "Dactylospora","Dactylospora","Gyalecta","Gyalidea","Gyalideopsis","Halecania",
+    "Heterodermia","Ionaspis","Jamesiella","Lichenoconium","Lopadium","Loxospora",
+    "Micarea","Micarea","Muellerella","Mycobilimbia","Ochrolechia","Pachyphiale",
+    "Physcia","Physconia","Placynthiella","Polycoccum","Porina","Protomicarea",
+    "Protothelenella","Ramonia","Rinodina","Ropalospora","Sagedia","Sclerococcum",
+    "Scoliciosporum","Scutula","Stigmidium","Strangospora","Tetramelas","Vezdaea",
+    "Xerotrema","Zwackhiomyces", "Arthopyrenia", "Sclerococcum", "Collemopsidium", "Halecania", "Diplotomma", "Protothelenella", "Ramonia", "Abrothallus", "Epicladonia", "Epithamnolia", "Lecania", "Lichenodiplis", "Melaspilea", "Melaspilea", "Phaeospora", "Pyrenidium", "Taeniolella"
+  )
+)
+
+# Remove rows matching any of these entries
+tax_df <- tax_df %>%
+  anti_join(entries_to_remove, by = c("kingdom", "phylum", "class", "order", "family", "genus"))
+
+genus_mapping <- genus_mapping %>%
+  anti_join(entries_to_remove, by = c("kingdom", "phylum", "class", "order", "family", "genus"))
+
+tax_df <- unique(tax_df)
+
+tax_df <- tax_df %>% filter(species %in% unique(names$new_name))
+
+unique(names %>% filter(!new_name %in% unique(tax_df$species)) %>% select(new_name))
+
+tax_df <- tax_df %>%
+  mutate(order = case_when(
+    family == "Protothelenellaceae" ~ "Baeomycetales",
+    TRUE ~ order   # leave all other values of `order` unchanged
+  ))
+
+# Extract rows with duplicated species names
+duplicated_species_df <- tax_df %>%
+  group_by(species) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+# View the resulting dataframe
+duplicated_species_df
+
+unique(names %>% filter(!str_split_i(names$new_name, " ", 1) %in% unique(tax_df$genus)) %>% select(new_name))
+
+genera <- unique(data.frame(genus = str_split_i(names$new_name, " ", 1)))
+genera <- genera %>% filter(!genus %in% tax_df$genus)
+
+# stats
+table(tax_df$phylum) / nrow(tax_df)
+# 2.2% of British licehn are basidiomycetes and 97.8% are ascos
+
+length(unique(tax_df$class))
+sort(table(tax_df$class)/ nrow(tax_df))
+# 16 classes
+
+# Write out final file
+# write.csv(tax_df, "Taxonomy/taxonomy_british_lichen_final.csv")
+
+```
+
+## Manual additions from Consortium of Lichen Herbaria Taxonomy Explorer
+```{r}
+# Manually compiled taxonomy for 20 genera (best current estimates).
+
+genus_taxonomy <- tibble::tribble(
+  ~genus,             ~kingdom, ~phylum,      ~class,             ~order,           ~family,
+
+  # 1) Acremonium
+  "Acremonium",       "Fungi",  "Ascomycota", "Sordariomycetes",  "Hypocreales",    "Hypocreaceae",
+
+  # 2) Roselliniella
+  "Roselliniella",    "Fungi",  "Ascomycota", "Sordariomycetes",  "Sordariales",  "Sordariales_family_incertae_sedis",
+
+  # 3) Peridothelia
+  "Peridothelia",     "Fungi",  "Ascomycota", "Eurotiomycetes",   "Verrucariales",  "Verrucariaceae",
+
+  # 4) Adelolechia
+  "Adelolechia",      "Fungi",  "Ascomycota", "Lecanoromycetes",  "Lecanorales",    "Lecideaceae",
+
+  # 5) Corticiruptor
+  "Corticiruptor",    "Fungi",  "Ascomycota", "Lecanoromycetes",  "Lecanoromycetes_order_incertae_sedis",               "Lecanoromycetes_family_incertae_sedis",
+
+  # 6) Arthophacopsis
+  "Arthophacopsis",   "Fungi",  "Ascomycota", "Dothideomycetes",  "Abrothallales",  "Abrothallaceae",
+
+  # 7) Mycoglaena
+  "Mycoglaena",       "Fungi",  "Ascomycota", "Dothideomycetes",  "Pleosporales",   "Arthopyreniaceae",
+
+  # 8) Crustodiplodina
+  "Crustodiplodina",  "Fungi",  "Ascomycota", "Dothideomycetes",  NA,               NA,
+
+  # 9) Schaereria
+  "Schaereria",       "Fungi",  "Ascomycota", "Lecanoromycetes",  "Schaereriales",  "Schaereriaceae",
+
+  # 10) Bachmanniomyces
+  "Bachmanniomyces",  "Fungi",  "Ascomycota", "Pezizomycotina_class_incertae_sedis",   "Pezizomycotina_order_incertae_sedis",               "Pezizomycotina_family_incertae_sedis",
+
+  # 11) Aquacida
+  "Aquacida",         "Fungi",  "Ascomycota", NA, NA, NA,
+
+  # 12) Bactrospora
+  "Bactrospora",      "Fungi",  "Ascomycota", "Arthoniomycetes",  "Arthoniales",    "Roccellaceae",
+
+  # 13) Clathroporinopsis
+  "Clathroporinopsis","Fungi",  "Ascomycota", "Lecanoromycetes",  "Gyalectales",    "Gyalectaceae",
+
+  # 14) Myochroidea
+  "Myochroidea",      "Fungi",  "Ascomycota", "Lecanoromycetes",  "Peltigerales",   "Pannariaceae",
+
+  # 15) Puttea
+  "Puttea",           "Fungi",  "Ascomycota", "Lecanoromycetes",  "Lecanorales",    "Tephromelataceae",
+
+  # 16) Sarcosagium
+  "Sarcosagium",      "Fungi",  "Ascomycota", "Lecanoromycetes",  "Baeomycetales",  "Baeomycetaceae",
+
+  # 17) Biatoridium
+  "Biatoridium",      "Fungi",  "Ascomycota", "Lecanoromycetes",  "Lecanorales",    "Pezizomycotina_family_incertae_sedis",
+
+  # 18) Piccolia
+  "Piccolia",         "Fungi",  "Ascomycota", "Lecanoromycetes",  "Lecanorales",    "Piccoliaceae",
+
+  # 19) Lecanidion
+  "Lecanidion",       "Fungi",  "Ascomycota", "Lecanoromycetes",  "Lecanorales",    "Pilocarpaceae",
+
+  # 20) Intralichen
+  "Intralichen",      "Fungi",  "Ascomycota", "Dothideomycetes",  "Pezizomycotina_order_incertae_sedis",               "Pezizomycotina_family_incertae_sedis",
+
+  # 21) Botryolepraria
+  "Botryolepraria", "Fungi",  "Ascomycota",    "Lecanoromycetes",    "Leprocaulales",      "Leprocaulaceae",
+
+  # 22) Buelliella
+  "Buelliella",     "Fungi",  "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 23) Burgoa
+  "Burgoa",         "Fungi",  "Basidiomycota", "Agaricomycetes",     "Cantharellales",     "Hydnaceae",
+
+  # 24) Leightoniomyces
+  "Leightoniomyces","Fungi",  "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 25) Cercidospora
+  "Cercidospora",   "Fungi",  "Ascomycota",    "Dothideomycetes",    "Pleosporales",       "Dacampiaceae",
+
+  # 26) Chionosphaera
+  "Chionosphaera",  "Fungi",  "Basidiomycota", "Cystobasidiomycetes","Cystobasidiales",    "Cystobasidiaceae",
+
+  # 27) Cladoniicola
+  "Cladoniicola",   "Fungi",  "Ascomycota",    "Leotiomycetes",      NA,                   NA,
+
+  # 28) Lathagium
+  "Lathagium",      "Fungi",  "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 29) Milospium
+  "Milospium",      "Fungi",  "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 30) Corticifraga
+  "Corticifraga",   "Fungi",  "Ascomycota",    "Eurotiomycetes",     "Sclerococcales",     "Dactylosporaceae",
+
+  # 31) Cyrtidula
+  "Cyrtidula",      "Fungi",  "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 32) Lichenosticta
+  "Lichenosticta",  "Fungi",  "Ascomycota",    "Dothideomycetes",    "Abrothallales",      "Abrothallaceae",
+
+  # 33) Endococcus
+  "Endococcus",     "Fungi",  "Ascomycota",    "Dothideomycetes",    NA,                   "Endococcaceae",
+
+  # 34) Neoechinodiscus
+  "Neoechinodiscus","Fungi",  "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 35) Dermatocrpon (often spelled Dermatocarpon)
+  "Dermatocrpon",   "Fungi",  "Ascomycota",    "Eurotiomycetes",     "Verrucariales",      "Verrucariaceae",
+
+  # 36) Epiphloea
+  "Epiphloea",      "Fungi",  "Ascomycota",    "Eurotiomycetes",     NA,                   NA,
+
+  # 37) Everniicola
+  "Everniicola",    "Fungi",  "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 38) Feltgeniomyces
+  "Feltgeniomyces", "Fungi",  "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 39) Fulgensis (often placed near Fulgensia)
+  "Fulgensis",      "Fungi",  "Ascomycota",    "Lecanoromycetes",    "Teloschistales",     "Teloschistaceae",
+
+  # 40) Hemigrapha
+  "Hemigrapha",     "Fungi",  "Ascomycota",    "Dothideomycetes",    "Asterinales",        "Hemigraphaceae",
+  
+  # 41) Illosporiopsis
+  # Commonly placed in Sordariomycetes with uncertain order/family (lichenicolous)
+  "Illosporiopsis", "Fungi",          "Ascomycota",    "Sordariomycetes",    NA,                    NA,
+
+  # 42) Homostegia
+  # Often lichenicolous, tentatively in Pleosporales (Dacampiaceae) or incertae sedis
+  "Homostegia",     "Fungi",          "Ascomycota",    "Dothideomycetes",    "Pleosporales",       "Dacampiaceae",
+
+  # 43) Hymenobia
+  # A lichen genus in Lichinomycetes (sometimes in Lichinaceae)
+  "Hymenobia",      "Fungi",          "Ascomycota",    "Lichinomycetes",     "Lichinales",         "Lichinaceae",
+
+  # 44) Illosporium
+  # Related to Illosporiopsis, generally Sordariomycetes incertae sedis
+  "Illosporium",    "Fungi",          "Ascomycota",    "Sordariomycetes",    NA,                    NA,
+
+  # 45) Kalchbrenneriella
+  # Lichenicolous fungus often placed in Dothideomycetes incertae sedis
+  "Kalchbrenneriella","Fungi",        "Ascomycota",    "Dothideomycetes",    NA,                    NA,
+
+  # 46) Lecidoma
+  # e.g. Lecidoma demissum, placed in Lecideales, Lecideaceae
+  "Lecidoma",       "Fungi",          "Ascomycota",    "Lecanoromycetes",    "Lecideales",         "Lecideaceae",
+
+  # 47) Sporostatia
+  # Typically in Lecanoromycetes, Rhizocarpales; some refs place it in Sporastatiaceae or Megalariaceae
+  "Sporostatia",    "Fungi",          "Ascomycota",    "Lecanoromycetes",    "Rhizocarpales",      "Sporastatiaceae",
+
+  # 48) Scytonema
+  # A genus of cyanobacteria (photobiont), not a fungus
+  "Scytonema",      "Bacteria",       "Cyanobacteria", "Cyanophyceae",       "Nostocales",         "Scytonemataceae",
+
+  # 49) Desmococcus
+  # A genus of green algae (photobiont) in the Chlorophyta
+  "Desmococcus",    "Plantae",        "Chlorophyta",   "Trebouxiophyceae",   NA,                    NA,
+
+  # 50) Trentepohlia
+  # A filamentous green alga in Ulvophyceae (Trentepohliales, Trentepohliaceae)
+  "Trentepohlia",   "Plantae",        "Chlorophyta",   "Ulvophyceae",        "Trentepohliales",    "Trentepohliaceae",
+
+  # 51) Monodictys
+  # Dematiaceous hyphomycete, commonly Dothideomycetes incertae sedis
+  "Monodictys",     "Fungi",          "Ascomycota",    "Dothideomycetes",    NA,                    NA,
+
+  # 52) Lichenohendersonia
+  # Lichenicolous fungus, typically Dothideomycetes incertae sedis
+  "Lichenohendersonia","Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                    NA,
+
+  # 53) Lichenopuccinia
+  # A basidiomycetous, lichenicolous fungus, likely in Pucciniomycetes
+  "Lichenopuccinia","Fungi",          "Basidiomycota", "Pucciniomycetes",    "Pucciniales",        NA,
+
+  # 54) Melaspileopsis
+  # Some references place it in Dothideomycetes, Asterinales
+  "Melaspileopsis", "Fungi",          "Ascomycota",    "Dothideomycetes",    "Asterinales",        NA,
+
+  # 55) Stictographa
+  # Typically in Dothideomycetes, Asterotexales, Stictographaceae
+  "Stictographa",   "Fungi",          "Ascomycota",    "Dothideomycetes",    "Asterotexales",      "Stictographaceae",
+
+  # 56) Minutoexcipula
+  # Lichenicolous fungus in Dothideomycetes; order/family often uncertain
+  "Minutoexcipula", "Fungi",          "Ascomycota",    "Dothideomycetes",    NA,                    NA,
+
+  # 57) Minutophoma
+  # Another lichenicolous genus, typically Dothideomycetes incertae sedis
+  "Minutophoma",    "Fungi",          "Ascomycota",    "Dothideomycetes",    NA,                    NA,
+
+  # 58) Mixtoconidium
+  # Lichenicolous fungus in Ascomycota, often Dothideomycetes incertae sedis
+  "Mixtoconidium",  "Fungi",          "Ascomycota",    "Dothideomycetes",    NA,                    NA,
+
+  # 59) Neolamya
+  # e.g. Neolamya peltigerae, also Dothideomycetes incertae sedis
+  "Neolamya",       "Fungi",          "Ascomycota",    "Dothideomycetes",    NA,                    NA,
+
+  # 60) Nigromacula
+  # e.g. Nigromacula uniseptata, typically Ascomycota incertae sedis or Dothideomycetes incertae sedis
+  "Nigromacula",    "Fungi",          "Ascomycota",    "Dothideomycetes",    NA,                    NA,
+  
+  # 61) arthonia
+  # Genus of lichenized/lichenicolous fungi in class Arthoniomycetes
+  "arthonia",       "Fungi",       "Ascomycota",    "Arthoniomycetes",    "Arthoniales",        "Arthoniaceae",
+
+  # 62) Roselliniopsis
+  # Generally placed in Dothideomycetes incertae sedis or near Pleosporales
+  "Roselliniopsis", "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 63) Cucurbidothis
+  # Likely Dothideomycetes incertae sedis (rarely documented lichenicolous genus)
+  "Cucurbidothis",  "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 64) Vouauxiomyces
+  # Lichenicolous, typically in Dothideomycetes incertae sedis
+  "Vouauxiomyces",  "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 65) Bastenia
+  # Another rarely placed lichenicolous genus, often left in Dothideomycetes incertae sedis
+  "Bastenia",       "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 66) Degelia
+  # A lichen genus in Lecanoromycetes, order Peltigerales, family Pannariaceae
+  "Degelia",        "Fungi",       "Ascomycota",    "Lecanoromycetes",    "Peltigerales",       "Pannariaceae",
+
+  # 67) Sarcogyna
+  # Possibly allied with Sarcogyne (Acarosporaceae) or another uncertain group. 
+  # We'll place in Lecanoromycetes, Acarosporales, Acarosporaceae as a best guess.
+  "Sarcogyna",      "Fungi",       "Ascomycota",    "Lecanoromycetes",    "Acarosporales",      "Acarosporaceae",
+
+  # 68) Strigula
+  # Well-known in Dothideomycetes, Strigulales, Strigulaceae
+  "Strigula",       "Fungi",       "Ascomycota",    "Dothideomycetes",    "Strigulales",        "Strigulaceae",
+
+  # 69) Psammina
+  # Lichenicolous genus in Dothideomycetes, often placed in Pleosporales, Dacampiaceae
+  "Psammina",       "Fungi",       "Ascomycota",    "Dothideomycetes",    "Pleosporales",       "Dacampiaceae",
+
+  # 70) Pseudorobillarda
+  # Dematiaceous fungus, typically Dothideomycetes incertae sedis
+  "Pseudorobillarda","Fungi",      "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 71) Psorotichia
+  # Lichen genus in Lichinomycetes, Lichinales, Lichinaceae
+  "Psorotichia",    "Fungi",       "Ascomycota",    "Lichinomycetes",     "Lichinales",         "Lichinaceae",
+
+  # 72) Raciborskiomyces
+  # Lichenicolous fungus in Dothideomycetes incertae sedis
+  "Raciborskiomyces","Fungi",      "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 73) Randlanea
+  # Known from Randlanea usneicola (lichenicolous), placed in Lecanoromycetes incertae sedis
+  "Randlanea",      "Fungi",       "Ascomycota",    "Lecanoromycetes",    NA,                   NA,
+
+  # 74) Reconditella
+  # Lichenicolous, typically Dothideomycetes incertae sedis
+  "Reconditella",   "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 75) Refractohilum
+  # Another lichenicolous genus, Dothideomycetes incertae sedis
+  "Refractohilum",  "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 76) Rhaphidicyrtis
+  # Lichenicolous fungus in Dothideomycetes incertae sedis
+  "Rhaphidicyrtis", "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 77) Roesleria
+  # Known from Roesleria subterranea, in class Leotiomycetes, order Helotiales, family Roesleriaceae
+  "Roesleria",      "Fungi",       "Ascomycota",    "Leotiomycetes",      "Helotiales",         "Roesleriaceae",
+
+  # 78) Rosellinula
+  # Lichenicolous in Dothideomycetes incertae sedis
+  "Rosellinula",    "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 79) Sarcopyrenia
+  # Eurotiomycetes, order Sarcopyreniales, family Sarcopyreniaceae
+  "Sarcopyrenia",   "Fungi",       "Ascomycota",    "Eurotiomycetes",     "Sarcopyreniales",    "Sarcopyreniaceae",
+
+  # 80) Vouauxiella
+  # Lichenicolous, typically Dothideomycetes incertae sedis
+  "Vouauxiella",    "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 81) Sporormiella
+  # Placed in Dothideomycetes, Pleosporales, family Sporormiaceae
+  "Sporormiella",   "Fungi",       "Ascomycota",    "Dothideomycetes",    "Pleosporales",       "Sporormiaceae",
+
+  # 82) Talpapellis
+  # Lichenicolous fungus in Dothideomycetes incertae sedis
+  "Talpapellis",    "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 83) Taeniolina
+  # Dematiaceous fungus in Dothideomycetes incertae sedis
+  "Taeniolina",     "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 84) Trichoconis
+  # Dematiaceous hyphomycete, generally Dothideomycetes incertae sedis
+  "Trichoconis",    "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 85) Trichothecium
+  # Class Sordariomycetes, order Hypocreales, family Trichotheciaceae
+  "Trichothecium",  "Fungi",       "Ascomycota",    "Sordariomycetes",    "Hypocreales",        "Trichotheciaceae",
+
+  # 86) Naetrcymbe
+  # Lichenicolous fungus in Dothideomycetes incertae sedis
+  "Naetrcymbe",     "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA,
+
+  # 87) Zevadia
+  # Lichenicolous fungus in Dothideomycetes incertae sedis
+  "Zevadia",        "Fungi",       "Ascomycota",    "Dothideomycetes",    NA,                   NA
+)
+
+# 1) Fill missing `order` with "_order_incertae_sedis", climbing up the ranks
+genus_taxonomy <- genus_taxonomy %>%
+  mutate(
+    order = case_when(
+      !is.na(order) ~ order,
+      !is.na(class) ~ paste0(class, "_order_incertae_sedis"),
+      !is.na(phylum) ~ paste0(phylum, "_order_incertae_sedis"),
+      !is.na(kingdom) ~ paste0(kingdom, "_order_incertae_sedis"),
+      TRUE ~ NA_character_
+    )
+  )
+
+# 2) Fill missing `family`. 
+#    If `order` ends with "_order_incertae_sedis", replace only that suffix with "_family_incertae_sedis".
+#    Otherwise, do the usual logic of appending "_family_incertae_sedis".
+missing_genera <- genus_taxonomy %>%
+  mutate(
+    family = case_when(
+      !is.na(family) ~ family,
+      
+      # If `order` is something like "Ascomycota_order_incertae_sedis"
+      # then do a string replace so we don't double-incertae_sedis
+      !is.na(order) & str_detect(order, "_order_incertae_sedis$") ~ str_replace(
+        order, "_order_incertae_sedis$", "_family_incertae_sedis"
+      ),
+      
+      # Else if `order` is non-NA but doesn't have that suffix
+      !is.na(order) ~ paste0(order, "_family_incertae_sedis"),
+      
+      # If `order` is NA, climb up to `class`, `phylum`, then `kingdom`
+      !is.na(class) ~ paste0(class, "_family_incertae_sedis"),
+      !is.na(phylum) ~ paste0(phylum, "_family_incertae_sedis"),
+      !is.na(kingdom) ~ paste0(kingdom, "_family_incertae_sedis"),
+      TRUE ~ NA_character_
+    )
+  )
+
+missing_genera[11,4] <- "Ascomycota_class_incertae_sedis"
+
+names_w_genera <- data.frame(genus = str_split_i(names$new_name, " ", 1), species = names$new_name)
+
+missing_genera <- missing_genera %>% left_join(names_w_genera)
+
+tax_df_2 <- bind_rows(tax_df, missing_genera)
+missing <- unique(tax_df_2 %>% filter(!species %in% unique(names$new_name)))
+
+tax_df <-tax_df_2
+
+tax_df <- tax_df %>% filter(kingdom == "Fungi")
+
+tax_df_missing <- tax_df %>% filter(!species == unique(names$new_name))
+
+missing <- names %>% filter(!new_name %in% tax_df$species)
+unique(missing$new_name)
+
+missing_tax <- tibble::tribble(
+  ~kingdom, ~phylum, ~class, ~order, ~family, ~genus, ~species,
+
+  # 1) Acremonium
+  "Fungi",  "Ascomycota", "Lecanoromycetes",  NA, "Epigloeaceae", "Epigloea", "Epigloea soleiformis")
+
+tax_df <- tax_df %>% filter(!species == unique(missing$new_name))
+
+tax_df <- bind_rows(tax_df, missing_tax)
+
+length(unique(tax_df$species))
+
+# write.csv(tax_df, "C:/Users/dylan/OneDrive/Desktop/PhD/gap_analysis/Taxonomy/taxonomy_british_lichen_final.csv")
+
+
+```
+
+# Figures
+
+# Figure 1. Name changes over time
+## Prep
+```{r}
+# Extract the 4-digit year from the text in parentheses, e.g. (1909), (1990), etc.
+bls <- bls %>%
+  mutate(
+    Year = str_extract(Authority, "\\(\\d{4}\\)")        # Extract "(YYYY)"
+  ) %>%
+  mutate(
+    Year = str_extract(Year, "\\d{4}") %>% as.integer()  # Convert to integer
+  )
+
+year_counts <- bls %>%
+  filter(!is.na(Year)) %>%         # remove any rows without a valid Year
+  group_by(Year) %>%
+  summarize(count = n(), .groups = "drop")
+
+
+year_counts[1,1] <- 2015
+year_counts[2,1] <- 2018
+
+```
+
+## g1 and g2
+```{r}
+
+# Updated Flora dataset
+flora_df <- data.frame(
+  Year = c(1801, 1871, 1921, 1965, 1970, 1992, 2009, 2015, 2017, 2018, 2022, 2023, 2025),
+  Number_on_UK_checklist = c(225, 787, 1255, 1365, 1372, 1487, 1894, 1901, 1959, 1965, 2016, 2040, 2068),
+  Flora = c("", "Leighton", "Annie Lorrain Smith", "Laundon", "Duncan", "Purvis et al.", "Smith et al.", "BLS", "BLS", "BLS", "BLS", "BLS", "BLS")
+)
+
+# Add the described species dataset
+total_over_time <- bls %>% select(Name, Current.Taxon.Name, Is.Current.Name., Year)
+total_over_time[6769, 4] <- 2015
+total_over_time[7582, 4] <- 2018
+
+df <- total_over_time %>%
+  mutate(
+    Current.Taxon.Name = if_else(
+      is.na(Current.Taxon.Name) | Current.Taxon.Name == "",
+      Name,
+      Current.Taxon.Name
+    ),
+    FinalName = if_else(Is.Current.Name. == "Yes", Name, Current.Taxon.Name)
+  )
+
+df_simplified <- df %>%
+  group_by(FinalName) %>%
+  summarize(
+    earliest_year = min(Year, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!is.infinite(earliest_year))
+
+df_counts <- df_simplified %>%
+  group_by(earliest_year) %>%
+  summarize(n_new_species = n(), .groups = "drop")
+
+all_years <- seq(min(df_counts$earliest_year), max(df_counts$earliest_year))
+
+df_full <- data.frame(Year = all_years) %>%
+  left_join(df_counts, by = c("Year" = "earliest_year")) %>%
+  mutate(n_new_species = replace_na(n_new_species, 0)) %>%
+  mutate(total_species = cumsum(n_new_species))
+
+# Add the only lichen described species
+total_over_time_l <- bls %>% dplyr::mutate(Group = replace_na(Group, "NA")) %>% dplyr::filter(!Group == "LF") %>%
+  filter(!Group == "F") %>%
+  filter(!Group == "CR") %>%
+  select(Name, Current.Taxon.Name, Is.Current.Name., Year)
+
+df_2 <- total_over_time_l %>%
+  mutate(
+    Current.Taxon.Name = if_else(
+      is.na(Current.Taxon.Name) | Current.Taxon.Name == "",
+      Name,
+      Current.Taxon.Name
+    ),
+    FinalName = if_else(Is.Current.Name. == "Yes", Name, Current.Taxon.Name)
+  )
+
+df_2_simplified <- df_2 %>%
+  group_by(FinalName) %>%
+  summarize(
+    earliest_year = min(Year, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!is.infinite(earliest_year))
+
+df_2_counts <- df_2_simplified %>%
+  group_by(earliest_year) %>%
+  summarize(n_new_species = n(), .groups = "drop")
+
+all_years_2 <- seq(min(df_2_counts$earliest_year), max(df_2_counts$earliest_year))
+
+df_full_2 <- data.frame(Year = all_years_2) %>%
+  left_join(df_2_counts, by = c("Year" = "earliest_year")) %>%
+  mutate(n_new_species = replace_na(n_new_species, 0)) %>%
+  mutate(total_species = cumsum(n_new_species))
+
+# master text size
+base_size <- 16
+bls_pts <- flora_df %>% filter(Flora == "BLS")
+
+# put the label a bit to the right of the last year
+label_x <- max(bls_pts$Year) + 3
+label_y <- bls_pts %>% filter(Year == max(Year)) %>% pull(Number_on_UK_checklist)
+
+bls_label_df <- data.frame(x = label_x, y = label_y, lab = "BLS")
+
+seg_df <- bls_pts %>%
+  transmute(x    = Year,
+            y    = Number_on_UK_checklist,
+            xend = label_x,
+            yend = label_y)
+
+x_pad  <- 5                     
+xmin   <- min(df_full$Year)
+xmax   <- max(flora_df$Year) + x_pad
+
+# Set base size
+base_size <- 14
+
+# first plot
+g1 <- ggplot() +
+  geom_line(
+    data = df_full,
+    aes(Year, total_species, colour = "Described LAT Species"),
+    linewidth = 1.5
+  ) +
+  geom_line(
+    data = df_full_2,
+    aes(Year, total_species, colour = "Described L Species"),
+    linewidth = 1.5
+  ) +
+  geom_line(
+    data = flora_df,
+    aes(Year, Number_on_UK_checklist, colour = "Number of Species in Flora"),
+    linewidth = 1.5
+  ) +
+  geom_point(
+    data = flora_df,
+    aes(Year, Number_on_UK_checklist, colour = "Number of Species in Flora"),
+    size = 4
+  ) +
+  geom_text_repel(
+    data          = flora_df %>% dplyr::filter(Flora != "" & Flora != "BLS"),
+    aes(Year, Number_on_UK_checklist, label = Flora),
+    fontface      = "bold",
+    size          = 5,  
+    box.padding   = 3,
+    point.padding = 1,
+    max.overlaps  = Inf,
+    segment.size  = .6,
+    force         = 2
+  ) +
+  geom_segment(
+    data = seg_df,
+    aes(x, y, xend = xend, yend = yend),
+    colour   = "black",
+    linewidth = .6,
+    linetype = "dotted"
+  ) +
+  geom_text(
+    data = bls_label_df,
+    aes(x, y, label = lab),
+    hjust    = 0,
+    fontface = "bold",
+    size     = 5
+  ) +
+  scale_colour_manual(
+    values = c("Described LAT Species"      = "grey10",
+               "Described L Species"        = "grey40",
+               "Number of Species in Flora" = "grey65")
+  ) +
+  labs(
+    x      = "Year",
+    y      = "Number of Species",
+    colour = NULL
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = base_size) +
+  theme(
+    axis.title      = element_text(size = 16, face = "bold"),
+    axis.text       = element_text(size = 14),
+    legend.title    = element_text(size = 15, face = "bold"),
+    legend.text     = element_text(size = 13),
+    plot.margin     = margin(t = 5, r = 40, b = 5, l = 5, unit = "pt")
+  )
+
+print(g1)
+
+# g2
+g2 <- ggplot(year_counts, aes(Year, count)) +
+  geom_col(fill = "grey60") +
+  geom_smooth(colour = "black", linewidth = 1, se = FALSE) +
+  labs(
+    x = "Year",
+    y = "Described Species / Year"
+  ) +
+  theme_minimal(base_size = base_size) +
+  theme(
+    axis.title  = element_text(size = 16, face = "bold"),
+    axis.text   = element_text(size = 14)
+  )
+
+print(g2)
+
+combined <- ggarrange(
+  g2, g1,
+  labels = c("A", "B"),
+  font.label = list(size = 20, face = "bold"),
+  ncol = 2
+)
+
+combined
+
+
+```
+
+## Figure 2. Number of species per database
+```{r}
+
+# ── build the data exactly as you did ───────────────────────────────────
+mtssu_comb$marker <- "mtSSU"
+its_seq$marker    <- "ITS"
+nuclsu_comb$marker<- "nucLSU"
+nucSSU_seq$marker     <- "nucSSU"
+
+nucSSU_seq$Database   <- "GenBank"
+nucSSU_seq            <- unique(nucSSU_seq)
+
+markers_db <- mtssu_comb %>%                       # start with mtSSU rows
+  bind_rows(its_seq, nuclsu_comb, nucSSU_seq) %>%      # add the other three
+  select(species, Database, marker) %>% 
+  distinct() %>%                                   # unique species × DB × marker
+  count(Database, marker, name = "count")          # summarise to counts
+
+# ── plot with larger, consistent typography ─────────────────────────────
+ggplot(markers_db, aes(marker, count, fill = Database)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    x    = "Marker",
+    y    = "Number of Species",
+    fill = "Database"
+  ) +
+  theme_minimal(base_size = 14) +                 # global bump
+  theme(
+    axis.title      = element_text(size = 16, face = "bold"),
+    axis.text.x     = element_text(size = 14),
+    axis.text.y     = element_text(size = 14),
+    legend.title    = element_text(size = 15, face = "bold"),
+    legend.text     = element_text(size = 13),
+    legend.key.width  = unit(1.6, "cm"),
+    legend.key.height = unit(1.6, "cm"),
+    legend.position = "right"
+  )
+
+
+```
+
+## Figure 3. Number of species Venn Diagram
+```{r}
+# Load species per barcode
+species_ITS    <- unique(its_seq$species)
+species_mtSSU  <- unique(mtssu_comb$species)
+species_nucLSU <- unique(nuclsu_comb$species)
+species_nucSSU <- unique(nucSSU_seq$species)
+
+# Larger plotting region
+par(mar = c(4, 4, 4, 4))
+
+# Fresh page plot Venn Diagram
+grid.newpage()
+
+venn.plot <- venn.diagram(
+  x = list(
+    ITS    = species_ITS,
+    mtSSU  = species_mtSSU,
+    nucLSU = species_nucLSU,
+    nucSSU = species_nucSSU
+  ),
+  filename       = NULL,
+
+  # circle styling
+  fill           = c("cornflowerblue", "green", "yellow", "orange"),
+  alpha          = 0.5,
+
+  # text sizes
+  cex            = 1.8, 
+  fontface       = "bold",
+
+  cat.cex        = 1.5, 
+  cat.fontface   = "bold",
+
+  # label placement tweaks
+  cat.pos        = c(-20, 20, 180, 180),
+  cat.dist       = c( 0.22, 0.22, -0.12, -0.12),
+  cat.just       = list(c(0.5,0.5), c(0.5,0.5), c(0.5,0.5), c(0.5,0.5)),
+
+  # No main title
+  main           = "",
+  main.cex       = 1.8
+)
+
+grid.draw(venn.plot)
+
+```
+
+# Figure 4. Conservation Indices
+```{r}
+# Load data
+superdict <- read.csv("SUPERDICT_28-08-2023(superdict).csv")
+
+# Select and rename
+cons_eval <- superdict %>% 
+  select(Current.taxon.name, Cons.eval) %>%
+  dplyr::rename(species = Current.taxon.name) %>%
+  mutate(sequence = "test")
+
+cons_eval <- fix_names(cons_eval, names)
+
+# Clean up strings
+cons_eval <- cons_eval %>%
+  mutate(Cons.eval = trimws(Cons.eval),
+         species = trimws(gsub("\\?", "", species))) %>%
+  mutate(across(everything(), ~ na_if(.x, ""))) %>%
+  filter(str_count(species, "\\S+") >= 2) %>%
+  mutate(species = str_extract(species, "^\\S+\\s+\\S+"),
+         Cons.eval = gsub("n/a", NA, Cons.eval)) %>%
+  na.omit()
+
+# Drop temp column
+cons_eval <- cons_eval %>% select(-sequence)
+
+# Add marker presence/absence
+cons_eval <- cons_eval %>%
+  mutate(
+    ITS = ifelse(species %in% its_seq$species, 1, 0),
+    mtssu = ifelse(species %in% mtssu_comb$species, 1, 0),
+    nuclsu = ifelse(species %in% nuclsu_comb$species, 1, 0),
+    nucssu = ifelse(species %in% nucSSU_seq$species, 1, 0)
+  )
+
+# Filter to relevant species
+cons_eval <- cons_eval %>% 
+  filter(species %in% names$new_name) %>%
+  distinct()  # Remove duplicates
+
+# Clean again
+cons_eval$Cons.eval <- gsub("\\?", "", cons_eval$Cons.eval)
+
+# Split IUCN codes into rows
+valid_IUCN_codes <- c("LC", "NT", "VU", "EN", "CR", "DD", "NE", "EX")
+
+# Split out IUCN codes, keep only valid ones
+cons_eval_long <- cons_eval %>%
+  mutate(ConsCodes = strsplit(Cons.eval, " ")) %>%
+  unnest(ConsCodes) %>%
+  filter(ConsCodes %in% valid_IUCN_codes)
+
+# Count species before pivot
+total_counts <- cons_eval_long %>%
+  group_by(ConsCodes) %>%
+  summarise(total_species = n_distinct(species), .groups = "drop")
+
+# Pivot to long format for plotting
+cons_eval_long <- cons_eval_long %>%
+  pivot_longer(
+    cols = c(ITS, mtssu, nuclsu, nucssu),
+    names_to = "marker",
+    values_to = "present"
+  ) %>%
+  group_by(ConsCodes, marker) %>%
+  summarise(prop_with_seq = mean(present), .groups = "drop")
+
+# Define gray shades for all 4 markers
+gray_colors <- c(
+  "ITS"    = "grey20",
+  "mtssu"  = "grey40",
+  "nuclsu" = "grey60",
+  "nucssu" = "grey80"
+)
+
+# Compute the maximum height of bars for each IUCN category
+max_heights <- cons_eval_long %>%
+  group_by(ConsCodes) %>%
+  summarize(max_prop = max(prop_with_seq), .groups = "drop") %>%
+  left_join(total_counts, by = "ConsCodes")
+
+# Make sure ConsCodes has the correct order
+cons_eval_long$ConsCodes <- factor(cons_eval_long$ConsCodes, levels = valid_IUCN_codes)
+max_heights$ConsCodes <- factor(max_heights$ConsCodes, levels = valid_IUCN_codes)
+
+# Plot
+ggplot(cons_eval_long, aes(x = ConsCodes, y = prop_with_seq, fill = marker)) +
+  geom_col(position = "dodge") +
+  geom_text(
+    data = max_heights,
+    aes(x = ConsCodes, y = max_prop + 0.03, label = total_species),
+    inherit.aes = FALSE,
+    vjust   = 0,
+    fontface = "bold",
+    size    = 5
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(
+    values = gray_colors,
+    labels = c("ITS" = "ITS", "mtssu" = "mtSSU",
+               "nuclsu" = "nucLSU", "nucssu" = "nucSSU")
+  ) +
+  labs(
+    x = "IUCN Category",
+    y = "Proportion of Category with a Sequenced Species",
+    fill = "Marker"
+  ) +
+
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title       = element_text(size = 16, face = "bold"),
+    axis.text        = element_text(size = 14),
+    legend.title     = element_text(size = 15, face = "bold"),
+    legend.text      = element_text(size = 13),
+    legend.key.width  = unit(2, "cm"),
+    legend.key.height = unit(2, "cm"),
+    legend.position  = "right"
+  )
+
+
+```
+
+## Figure 5. Growth Form Taxon Dictionary
+```{r}
+bls_growth_forms <- read_xlsx("Taxonomy/bls-taxon-dictionary-2024-05-09_GROWTH FORMS.xlsx")
+
+bls_growth_forms <- bls_growth_forms %>% select(`Current Taxon Name`, Group) %>%
+  dplyr::rename(species = `Current Taxon Name`) %>% unique() %>% na.omit()
+
+# Fix: remove weird group labels
+bls_growth_forms <- bls_growth_forms %>%
+  filter(!Group %in% c("A", "CBM", "CR", "Lepraria botryoides"))
+
+# Fix: standardize short codes using exact matching
+bls_growth_forms <- bls_growth_forms %>%
+  mutate(Group = case_when(
+    Group == "C"  ~ "Crustose",
+    Group == "F"  ~ "Ambiguous",
+    Group == "FO" ~ "Foliose",
+    Group == "LF" ~ "Lichenicolous Fungus",
+    Group == "B"   ~ "Fruticose",
+    Group == "S"   ~ "Squamulose",
+    TRUE ~ Group  # keep original if not matched
+  ))
+
+
+bls_growth_forms <- unique(bls_growth_forms)
+
+# Function to get proportions per marker
+get_growth_form_counts <- function(seq_df, marker_name, growth_forms_df) {
+  seq_df %>%
+    filter(species %in% growth_forms_df$species) %>%
+    left_join(growth_forms_df, by = "species") %>%
+    count(Group) %>%
+    mutate(
+      marker = marker_name,
+      proportion = n / sum(n)
+    )
+}
+
+bls_growth_forms <- bls_growth_forms %>% select(species, Group)
+
+bls_growth_forms <- unique(bls_growth_forms)
+
+growth_its <- its_seq %>% select(species) %>%
+  filter(species %in% bls_growth_forms$species) %>%
+  unique() %>%
+  left_join(bls_growth_forms) %>%
+  count(Group)%>%
+  mutate(
+    marker = "ITS",
+    proportion = n / sum(n)
+)
+
+growth_nuclsu <- nuclsu_comb %>% select(species) %>%
+  filter(species %in% bls_growth_forms$species) %>%
+  unique() %>%
+  left_join(bls_growth_forms) %>%
+  count(Group)%>%
+  mutate(
+    marker = "nucLSU",
+    proportion = n / sum(n)
+)
+
+growth_nucssu <- nucSSU_seq %>% select(species) %>%
+  filter(species %in% bls_growth_forms$species) %>%
+  unique() %>%
+  left_join(bls_growth_forms) %>%
+  count(Group)%>%
+  mutate(
+    marker = "nucSSU",
+    proportion = n / sum(n)
+)
+
+growth_mtssu <- mtssu_comb %>% select(species) %>%
+  filter(species %in% bls_growth_forms$species) %>%
+  unique() %>%
+  left_join(bls_growth_forms) %>%
+  count(Group) %>%
+  mutate(
+    marker = "mtSSU",
+    proportion = n / sum(n)
+)
+
+
+# Add All as a reference bar using full dataset
+growth_all_total <- bls_growth_forms %>%
+  count(Group) %>%
+  mutate(
+    marker = "All",
+    proportion = n / sum(n)
+  )
+
+# Combine all
+growth_all <- bind_rows(growth_its, growth_nuclsu, growth_nucssu, growth_mtssu, growth_all_total)
+
+# Factor levels for stacking largest to smallest within each bar
+# Get average proportions across markers for sorting
+growth_order <- growth_all %>%
+  group_by(Group) %>%
+  summarise(avg = mean(proportion)) %>%
+  arrange(desc(avg)) %>%
+  pull(Group)
+
+# Set custom stacking order for growth forms (bottom to top in barplot)
+growth_all$Group <- factor(growth_all$Group,
+                           levels = c("Squamulose","Ambiguous", "Fruticose", "Foliose", "Lichenicolous Fungus", "Crustose"))
+
+# One name-matched vector of magick tiles
+pattern_tiles <- c(
+  "Squamulose"            = "bricks",        # chunky rectangles
+  "Ambiguous"             = "hs_vertical",  # chess board
+  "Fruticose"             = "crosshatch30",         # plus symbols
+  "Foliose"               = "horizontal",         # horizontal stripes
+  "Lichenicolous Fungus"  = "gray25",       # dots
+  "Crustose"              = "crosshatch"         # saw-tooth
+)
+
+# Single-layer magick pattern plot
+ggplot(
+  growth_all,
+  aes(x = marker,
+      y = proportion,
+      pattern_type = Group)
+) +
+  geom_col_pattern(
+    position              = "stack",
+    pattern               = "magick",
+    pattern_fill          = "black",
+    pattern_colour        = "black",
+    fill                  = "white",
+    colour                = "black"
+  ) +
+  scale_pattern_type_manual(values = pattern_tiles, name = "Growth Form") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    x = "Marker",
+    y = "Species Proportion"
+  ) +
+    theme_minimal(base_size = 14) +
+  theme(
+    axis.title      = element_text(size = 16, face = "bold"),
+    axis.text       = element_text(size = 14),
+    legend.title    = element_text(size = 15, face = "bold"),
+    legend.text     = element_text(size = 13),
+    legend.key.width  = unit(2, "cm"),
+    legend.key.height = unit(2, "cm"),
+    legend.position = "right"
+  )
+
+
+```
+
+
+# Priority Taxa list
+## Family
+```{r}
+# Abundace
+bls_sp_counts <- read_excel("FW_ Species counts by country/BLS species counts by VC Sept 2024.xlsx")
+
+# Fix and clean
+colnames(bls_sp_counts) <- c("BLS number", "Taxon", "Vice county", bls_sp_counts[1, 4:ncol(bls_sp_counts)])
+bls_sp_counts <- bls_sp_counts[-1,]
+bls_sp_counts <- bls_sp_counts %>% select(-`Vice county`, -`BLS number`)
+
+# Make every column numeric
+sp_counts <- rowSums(apply(bls_sp_counts[, 2:ncol(bls_sp_counts)], 2, as.numeric), na.rm = T)
+
+bls_sp_counts_final <- data.frame(species = bls_sp_counts[,1], counts = sp_counts)
+
+# Totals
+bls_sp_counts_final <- bls_sp_counts_final[c(-2552, -2553), ]
+bls_sp_counts_final <- na.omit(bls_sp_counts_final)
+
+# Just take species
+bls_sp_counts_final$species <- sapply(strsplit(bls_sp_counts_final$Taxon, "\\s+"), function(words) {
+  paste(words[1:min(2, length(words))], collapse = " ")
+})
+
+# group by and sum by Taxon
+bls_sp_counts_final <- bls_sp_counts_final %>% group_by(species) %>%
+  summarize(counts = sum(counts))
+
+# Remove rows where counts is 0
+bls_sp_counts_final <- bls_sp_counts_final %>%
+  filter(counts > 0)
+
+# Tax data
+tax_ITS <- tax_df %>% filter(species %in% its_seq$species) %>% left_join(bls_sp_counts_final)
+tax_ssu <- tax_df %>% filter(species %in% mtssu_comb$species) %>% left_join(bls_sp_counts_final)
+tax_lsu <- tax_df %>% filter(species %in% nuclsu_comb$species)%>% left_join(bls_sp_counts_final)
+tax_all <- tax_df %>% filter(species %in% names$new_name)%>% left_join(bls_sp_counts_final)
+tax_all$counts <- tax_all$counts %>% replace_na(0)
+family_abund <- tax_all %>% group_by(family) %>%  summarize(abund = sum(counts))
+
+count_ITS  <- sort(table(tax_ITS$class))
+count_ssu  <- sort(table(tax_ssu$class))
+count_lsu  <- sort(table(tax_lsu$class))
+count_all  <- sort(table(tax_all$class))
+
+# Get unique categories (classes) from all datasets
+categories <- unique(c(names(count_ITS), names(count_ssu), names(count_lsu), names(count_all)))
+
+# Summarize each dataset
+tax_ITS_counts <- tax_ITS %>% 
+  group_by(family) %>% 
+  summarize(n_ITS = n(), .groups = "drop")
+
+tax_ssu_counts <- tax_ssu %>% 
+  group_by(family) %>% 
+  summarize(n_ssu = n(), .groups = "drop")
+
+tax_lsu_counts <- tax_lsu %>% 
+  group_by(family) %>% 
+  summarize(n_lsu = n(), .groups = "drop")
+
+tax_all_counts <- tax_all %>% 
+  group_by(family) %>% 
+  summarize(n_all = n(), .groups = "drop")
+
+# Full join them all, so families in ANY dataset are kept
+family_counts <- tax_ITS_counts %>%
+  full_join(tax_ssu_counts, by = "family") %>%
+  full_join(tax_lsu_counts, by = "family") %>%
+  full_join(tax_all_counts, by = "family") %>%
+  full_join(family_abund, by = "family")
+
+# Replace NA with 0 in numeric count columns
+family_counts <- family_counts %>%
+  mutate(
+    n_ITS = replace_na(n_ITS, 0),
+    n_ssu = replace_na(n_ssu, 0),
+    n_lsu = replace_na(n_lsu, 0),
+    n_all = replace_na(n_all, 0)
+  )
+
+family_counts <- na.omit(family_counts)
+
+# Exclude rows containing "incertae_sedis"
+family_counts <- family_counts %>%
+  filter(!str_detect(family, "incertae_sedis"))
+
+family_counts$n_sum <- family_counts$n_ITS + family_counts$n_ssu + family_counts$n_lsu
+
+family_prior <- family_counts %>% filter(n_sum == 0)
+
+family_prior <- family_prior %>% select(family) %>%
+  left_join(tax_df)
+
+family_prior <- family_prior %>% left_join(bls_sp_counts_final)
+
+family_prior <- family_prior %>%
+  group_by(family) %>%
+  slice_max(counts, with_ties = FALSE)
+
+family_prior <- family_prior %>% select(family, species, counts)
+
+# write.csv(family_prior, "C:/Users/dylan/OneDrive/Desktop/PhD/gap_analysis/Priority_lists/family_priority_list.csv", row.names = F)
+
+```
+
+## Conservation 
+```{r}
+
+# Load data
+superdict <- read.csv("SUPERDICT_28-08-2023(superdict).csv")
+
+# Select and rename
+cons_eval <- superdict %>% 
+  select(Current.taxon.name, Cons.eval) %>%
+  dplyr::rename(species = Current.taxon.name) %>%
+  mutate(sequence = "test")
+
+# Optional: if you have a custom fix_names() function, uncomment this line
+cons_eval <- fix_names(cons_eval, names)
+
+# Clean up strings
+cons_eval <- cons_eval %>%
+  mutate(Cons.eval = trimws(Cons.eval),
+         species = trimws(gsub("\\?", "", species))) %>%
+  mutate(across(everything(), ~ na_if(.x, ""))) %>%
+  filter(str_count(species, "\\S+") >= 2) %>%
+  mutate(species = str_extract(species, "^\\S+\\s+\\S+"),
+         Cons.eval = gsub("n/a", NA, Cons.eval)) %>%
+  na.omit()
+
+# Drop temp column
+cons_eval <- cons_eval %>% select(-sequence)
+
+# Add marker presence/absence
+cons_eval <- cons_eval %>%
+  mutate(
+    ITS = ifelse(species %in% its_seq$species, 1, 0),
+    mtssu = ifelse(species %in% mtssu_comb$species, 1, 0),
+    nuclsu = ifelse(species %in% nuclsu_comb$species, 1, 0),
+    nucssu = ifelse(species %in% nucSSU_seq$species, 1, 0)
+  )
+
+# Filter to relevant species
+cons_eval <- cons_eval %>% 
+  filter(species %in% names$new_name) %>%
+  distinct()  # Remove duplicates
+
+# Clean agan
+cons_eval$Cons.eval <- gsub("\\?", "", cons_eval$Cons.eval)
+
+# --- PLOT PREP ---
+# STEP A: Split IUCN codes into rows
+valid_IUCN_codes <- c("LC", "NT", "VU", "EN", "CR", "DD", "NE", "EX")
+
+# Split out IUCN codes, keep only valid ones
+cons_eval_long <- cons_eval %>%
+  mutate(ConsCodes = strsplit(Cons.eval, " ")) %>%
+  unnest(ConsCodes) %>%
+  filter(ConsCodes %in% valid_IUCN_codes)
+
+sp_seq <- cons_eval_long %>% filter(ITS == 0)
+
+sp_seq <- sp_seq %>% filter(ConsCodes == "CR" | ConsCodes == "EN" | ConsCodes == "DD")
+
+sp_seq <- sp_seq %>% left_join(bls_sp_counts_final)
+
+sp_seq <- sp_seq %>% select(species, ConsCodes, counts)
+
+# write.csv(sp_seq, "C:/Users/dylan/OneDrive/Desktop/PhD/gap_analysis/Priority_lists/conservation_priority_list.csv", row.names = F)
+
+```
+
+## Most abundant
+```{r}
+
+missing_its <- names %>% filter(!new_name %in% its_seq$species) %>% dplyr::rename(species = new_name) %>% select(-old_name)
+
+missing_its <- missing_its %>% left_join(bls_sp_counts_final)
+
+missing_its <- unique(missing_its)
+
+top_77_missing_its <- missing_its %>%
+  slice_max(order_by = counts, n = 77)
+
+#write.csv(top_77_missing_its, "C:/Users/dylan/OneDrive/Desktop/PhD/gap_analysis/Priority_lists/most_abundant_priority_list.csv", row.names = F)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
