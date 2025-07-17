@@ -30,6 +30,8 @@ nucssu_seq_meta.csv \
 its_seq_meta.csv - Full ITS region
 
 ### Scripts:
-global_fungi_downloader.py - Python script to webscrape sequence data from the GlobalFungi database. \
+Retrieve_format_barcodes.Rmd - R Markdown that outlines all of the code used to webscrape and download data across databases, create the taxonomy file, cleanup and data wrangling, then figure and priority list creation. \
+global_fungi_downloader.py - Python script to webscrape sequence data from the GlobalFungi database.
+
 
 
