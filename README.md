@@ -9,5 +9,23 @@ Pipeline from data retrieval to coalescing and species name changing if necessar
 
 
 File Descriptions:
+Input Data:
 BLS species counts by VC Sept 2024.xlsx - British Lichen Society Surveys by vice-county (VC) completed by September 2024. 
-SUPERDICT_28-08-2023(superdict).csv - Conservation evaluations for each taxa from 
+SUPERDICT_28-08-2023(superdict).csv - Conservation evaluations for each taxa from Woods & Coppins, 2012.
+taxonomy_british_lichen_final.csv - Taxonomy of British lichen, collated from multiple databases (GBIF, ITIS, COL and Consortium of Lichen Herbaria Taxonomy Explorer)
+
+Priority Lists:
+conservation_priority_list.csv - taxa to prioritize for sequencing due to conservation concern.
+family_priority_list.csv - taxa to prioritize for sequencing due to their correspondent family lacking previous sequence data for British lichens.
+most_abundant_priority_list.csv - taxa to prioritize for sequencing due to their high frequency of capture on BLS surveys. 
+- all LAT that are missing sequences for each barcode.
+
+Sequence Data (metadata and sequence data stored in one csv for each barcode):
+mtssu_seq_meta.csv
+nuclsu_seq_meta.csv
+nucssu_seq_meta.csv
+its_seq_meta.csv - Full ITS region
+
+Scripts:
+global_fungi_downloader.py - Python script to webscrape sequence data from the GlobalFungi database.
+
